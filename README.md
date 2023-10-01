@@ -1,10 +1,10 @@
 hello, its firm for iceriver ks0
 
-rename to iceriverminer
+downlaod and rename to iceriverminer
 
 put in /var/update
 
-rename in /var/update miner.bgz to something like m_23424324_iner.bgz
+rename in folder /var/update file miner.bgz to something like m_23424324_iner.bgz
 
 reboot
 
