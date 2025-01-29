@@ -1,135 +1,721 @@
-param (
-    [string]$connectorCfgName,  # Параметр извне
-    [string]$imageName,         # Параметр извне
-    [string]$osType,            # Параметр извне
-    [string]$diskLocatorId      # Параметр извне
-)
+# This script was developed as an example pvs_connector script by Citrix Solution Architect Rob Zylowski and Developer Karl Gibson
+# This script allows the conversion of vDisks from vhd to vhdx as well
+# as the ability to use pvs versioning for App Layering Images
+# This script should be used with a Citrix App Layering Connector
+# Version 4 Developed 5-10-2017
+# Use at your own risk and test well.
 
-# Внутренние настройки
+#==========================================================
+#Constants
+$MCLI_SNAPIN_NAME = "McliPSSnapIn"
+$NEW_SNAPIN_NAME = "Citrix.PVS.SnapIn"
+$LOCATION_STACK_NAME = "pvs_connector_script"
+$scriptversion = "1.0"
+#==========================================================
+#Settings to Configure
+
+#1-Folder for script
 $ScriptFolder = "C:\Scripts"
+
+#2-Enable Convert to VHDX
 $bConvertToVHDX = $true
+#Enable a check for space in the store before converting to VHDX
 $bCheckForSpace = $true
+#Path to qemu-img.exe
 $QEMUPATH = "C:\Scripts\qemu-img.exe"
-$VHDXSubformat = "dynamic"
+#Format of VHDX file used in QEMU-IMG
+$VHDXSubformat="dynamic"
+
+#3-Enable PVS Versioning
 $bUSE_Versioning = $true
+#To use ImageName as the vDisk name Set this to $True
+#Note if current vDisks are not set to imagename then the latest published vDisk will become the first version
 $bUseImageNameAsvDiskName = $true
-$LOG_FILE = "$ScriptFolder\pvs_connector_script.log"
 
-# Уровни логирования
-enum LogLevel {
-    INFO
-    WARNING
-    ERROR
+#Log File Name
+$LOG_FILE  = "$ScriptFolder\pvs_connector_script.log"
+#==========================================================
+
+#Settings For Testing
+#$connectorCfgName= 'PVS Connector for XenDesktop'
+#$imageName= 'PVS_Win10'
+#$osType= 'Windows1064'
+#$diskLocatorId= '9d8b4851-b38a-4998-bec1-8310671ec69f' 
+##
+
+function Log 
+{
+    param([string]$Message)
+    (Get-Date -Format "[yyyy-MM-dd HH:mm:ss] ") + $Message | Out-File -FilePath $LOG_FILE -Append -Force
 }
 
-# Функция логирования
-function Log {
-    param(
-        [string]$Message,
-        [LogLevel]$Level = [LogLevel]::INFO
-    )
-    $logEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
-    $logEntry | Out-File -FilePath $LOG_FILE -Append -Force
-    Write-Host $logEntry
+Function FormatErrors()
+{
+	$NumToProcess = $Error.Count - 1
+	For ($i = $NumToProcess; $i -gt -1; $i-- )
+	{
+		If (!($Error[$i].Contains("disklocatorTest")))
+		{
+			Log "========================================================================" 
+			$MyError = "Error: " + $Error[$i].InvocationInfo.PositionMessage + "Exception: " + $Error[$i]
+			Log $MyError
+		}
+	}
+	$Error.Clear()
 }
 
-# Функция проверки свободного места (работает с локальными и сетевыми дисками)
-function Get-FreeSpace {
-    param (
-        [string]$Path
-    )
-    try {
-        if ($Path -match '^\\\\') {
-            # Для сетевых путей (CIFS/SMB)
-            $drive = (Get-SmbConnection -RemotePath $Path -ErrorAction Stop).RemotePath
+Log "========================================================================"
+Log "           Running Script For Image - $imageName"
+Log "========================================================================"
+Log "Script Version: $scriptversion" 
+Log "--- Variables Passed From Connector ---"
+Log "ConnectorCfgName: '$connectorCfgName'"
+Log "ImageName: '$imageName'"
+Log "OSType: '$osType'"
+Log "DiskLocatorId: '$diskLocatorId'"
+Log ""
+
+$global:FormatedErrors = ""
+
+$registeredSnapins = Get-PSSnapin -Registered
+
+$snapin = $registeredSnapins | Where Name -EQ $NEW_SNAPIN_NAME
+
+if ($snapin -eq $null) {
+    $snapin = $registeredSnapins | Where Name -EQ $MCLI_SNAPIN_NAME
+	if ($snapin.Name -eq $MCLI_SNAPIN_NAME)
+	{
+		Log "***Warning***"
+		Log "The registred PVS snapin is $MCLI_SNAPIN_NAME."
+		Log "This script is intended for use only with PVS 7.7 and above utilizing the $NEW_SNAPIN_NAME snapin."
+		Log "Please use the script created for the older $MCLI_SNAPIN_NAME snapin."
+		Log "Exiting Script"
+		Log "========================================================================"
+		Exit
+	}
+}
+
+if ($snapin -eq $null) {
+    Log "Error: No PVS console PowerShell snapin found."
+    Log "========================================================================"
+
+	Exit 1
+}
+
+Log "User Defined Settings"
+Log "============================================"
+if ($bUSE_Versioning)
+{
+	Log "Versioning is enabled"
+	if ($bUseImageNameAsvDiskName){Log "Use Image Name as vDIsk Name is enabled"} else {Log "Use Image Name as vDIsk Name is disabled"}
+} 
+else 
+{
+	Log "Versioning is disabled"
+	}
+if ($bConvertToVHDX)
+{
+	Log "Convert to VHDX is enabled"
+	if ($bCheckForSpace){Log "Check for Space is enabled"} else {Log "Check for Space is disabled"}
+} 
+else 
+{
+	Log "Convert to VHDX is disabled"
+}
+Log "============================================"
+Log ""
+
+Log "Using PVS snapin $($snapin.Name) at version $($snapin.Version)"
+Add-PSSnapin -Name $snapin.Name 
+
+#Get the path to the vhd we just imported in case we need it for the copy to other servers
+Log "Getting the path to the VHD we imported"
+#Get the disk locator so we can see how big the disk is
+$MyVHDDiskLocator = Get-PVSDisklocator -DiskLocatorId $diskLocatorId
+
+$storePath = (Get-PvsStore -StoreId $MyVHDDiskLocator.StoreId).Path
+Log "The Store Path was found to be:$storePath"
+$MyPVSDisk = Get-PvsDisk -DiskLocatorId $diskLocatorId
+if (!($?))
+{
+	Log "We were not able to find the imported vDisk for disklocatorId [$diskLocatorId]  -- exiting script"
+	FormatErrors
+	Exit
+}
+
+$MyVHDXPath = $MyPVSDisk.OriginalFile
+$MyVHDpath = $MyPVSDisk.OriginalFile
+Log "VHD Path for the original vDisk is [$MyVHDpath]"
+if ($MyVHDpath -eq $null)
+{
+	Log "We were not able to find the imported vDisk -- exiting script"
+	Log "========================================================================"
+	FormatErrors
+	Log "========================================================================"
+	Exit
+}
+if (!($MyVHDpath.Contains(".")))
+{
+	Log "We could not decipher the vDisk filename.  It might be too long for the Citrix PowerShell to handle.  Max length of the file path is 127 characters -- exiting script"
+	Log "========================================================================"
+	FormatErrors
+	Log "========================================================================"
+	Exit
+}
+
+# Determine if the file is VHD or VHDX
+$VHD_EXTENSION = if ($MyVHDpath -like "*.vhdx") { "vhdx" } else { "vhd" }
+Log "Detected file extension: $VHD_EXTENSION"
+
+#Get the vDisk Settings
+$VD_ActivationEnabled = $MyPVSDisk.ActivationDateEnabled
+$VD_ADPasswordEnabled = $MyPVSDisk.AdPasswordEnabled
+$VD_HAEnabled = $MyPVSDisk.HaEnabled
+$VD_PrinterManagementEnabled = $MyPVSDisk.PrinterManagementEnabled
+$VD_WritecacheType = $MyPVSDisk.WriteCacheType
+$VD_WriteCacheSize = $MyPVSDisk.WriteCacheSize
+$VD_LicenseMode = $MyPVSDisk.LicenseMode
+
+if ($bConvertToVHDX -and $VHD_EXTENSION -eq "vhd")
+{
+	Log "Convert to VHDX is Running."
+
+	$MyVHD = Get-Item -Path "$MyVHDpath"
+	$MyVHDBaseName = $MyVHD.BaseName
+	Log "VHD Base Name is $MyVHDBaseName"
+	$MyVHDBaseNameFull = "$MyVHDBaseName.vhd"
+	Log "VHD Base Name Full is $MyVHDBaseNameFull"
+	$MyVHDXName = "$MyVHDBaseName.vhdx"
+	Log "VHDX Path is $MyVHDXName"
+	$MyVHDXPath = "$storePath\$MyVHDXName"
+	Log "VHDX Full Path is $MyVHDXPath"
+	[long]$MyVHDsize = $MyVHD.Length / 1024 
+	$MyVHDsizeGB = "{0:N4}" -f ($MyVHDsize /1000000)
+	Log "Our VHD [$MyVHD] is [$MyVHDsizeGB] GB"
+
+	#Now lets see how much free space we have on the store
+	if ($bCheckForSpace)
+	{
+		Log "Checking to ensure space is available in the store"
+
+		$ArrFSUtillSpace = fsutil volume diskfree "$storePath"
+		$spFSUtilSpace = $ArrFSUtillSpace[2] -split (":")
+
+		$OS = [Environment]::OSVersion.Version
+        If (($OS.Major -eq 10) -and ($OS.Build -eq 14393)) {
+            Log "OS Version: Windows Server 2016"
+            [long]$StoreFreeSpace = $spFSUtilSpace[1]
+        } elseif (($OS.Major -eq 10) -and ($OS.Build -eq 17763)) {
+            Log "OS Version: Windows Server 2019"
+            [long]$StoreFreeSpace = ($spFSUtilSpace[1] -split " ")[1]
         } else {
-            # Для локальных путей
-            $drive = (Get-Item $Path).Root
-        }
-        $driveInfo = [System.IO.DriveInfo]::new($drive)
-        return $driveInfo.AvailableFreeSpace
-    } catch {
-        Log "Failed to get free space for path: $Path" -Level ERROR
-        throw
-    }
-}
-
-# Функция конвертации VHD в VHDX
-function Convert-VHDtoVHDX {
-    param (
-        [string]$VHDPath,
-        [string]$VHDXPath,
-        [string]$QEMUPATH,
-        [string]$VHDXSubformat
-    )
-    try {
-        Log "Converting VHD to VHDX: $VHDPath -> $VHDXPath"
-        Invoke-Expression "$QEMUPATH convert -O vhdx `"$VHDPath`" `"$VHDXPath`" -o subformat=$VHDXSubformat"
-        if (-not (Test-Path $VHDXPath)) {
-            throw "Conversion failed: VHDX file not found."
-        }
-        Log "Conversion successful."
-    } catch {
-        Log "Failed to convert VHD to VHDX: $_" -Level ERROR
-        throw
-    }
-}
-
-# Основной скрипт
-try {
-    Log "Starting script execution."
-    Log "Parameters received:"
-    Log "  - connectorCfgName: $connectorCfgName"
-    Log "  - imageName: $imageName"
-    Log "  - osType: $osType"
-    Log "  - diskLocatorId: $diskLocatorId"
-
-    # Получение информации о диске
-    $MyVHDDiskLocator = Get-PVSDisklocator -DiskLocatorId $diskLocatorId
-    if (-not $MyVHDDiskLocator) {
-        throw "Failed to get disk locator for ID: $diskLocatorId"
-    }
-
-    $storePath = (Get-PvsStore -StoreId $MyVHDDiskLocator.StoreId).Path
-    Log "Store path: $storePath"
-
-    $MyVHDpath = (Get-PvsDisk -DiskLocatorId $diskLocatorId).OriginalFile
-    if (-not $MyVHDpath) {
-        throw "Failed to find the imported vDisk."
-    }
-
-    Log "Original vDisk path: $MyVHDpath"
-
-    # Проверка и конвертация VHD/VHDX
-    $inputFileExtension = [System.IO.Path]::GetExtension($MyVHDpath)
-    if ($inputFileExtension -eq ".vhdx") {
-        Log "Input file is already VHDX. No conversion needed."
-    } elseif ($bConvertToVHDX) {
-        $MyVHD = Get-Item -Path $MyVHDpath
-        $MyVHDBaseName = $MyVHD.BaseName
-        $MyVHDXName = "$MyVHDBaseName.vhdx"
-        $MyVHDXPath = Join-Path -Path $storePath -ChildPath $MyVHDXName
-
-        if ($bCheckForSpace) {
-            $MyVHDsize = $MyVHD.Length
-            $StoreFreeSpace = Get-FreeSpace -Path $storePath
-            if ($StoreFreeSpace -lt $MyVHDsize) {
-                throw "Insufficient space on store to convert VHD to VHDX."
-            }
-            Log "Sufficient space available for conversion."
+            Log "OS Version not defined"
+            Exit
         }
 
-        Convert-VHDtoVHDX -VHDPath $MyVHDpath -VHDXPath $MyVHDXPath -QEMUPATH $QEMUPATH -VHDXSubformat $VHDXSubformat
-    }
+		$MyStoresizeGB =  "{0:N4}" -f ($StoreFreeSpace /1000000000)
+		Log "Our store [$storePath] has the following free space [$MyStoresizeGB] GB"
 
-    # Логика для работы с версиями (если включено)
-    if ($bUSE_Versioning) {
-        Log "Versioning is enabled."
-        # Дополнительная логика для работы с версиями...
-    }
+		If ($StoreFreeSpace -lt $MyVHDsize)
+		{
+			Log "There is insufficient space left on the store to convert the VHD to VHDX -- exiting script"
+			Exit
+		}
+		else
+		{
+			Log "The store has sufficient space to convert the vDisk from VHD to VHDX."
+		}
+	}
+	#Now lets convert the vhd to vhdx
+	#Format of command for QEMU convert -O vhdx e:\pvs_store\test.vhd e:\pvs_store\test.vhdx -o subformat=dynamic
+	Log "Running ./$QEMUPATH convert -O vhdx `"$MyVHDpath`" `"$MyVHDXPath`" -o subformat=$VHDXSubformat"
+	Invoke-Expression "$QEMUPATH convert -O vhdx `"$MyVHDpath`" `"$MyVHDXPath`" -o subformat=$VHDXSubformat"
 
-    Log "Script completed successfully."
-} catch {
-    Log "Script failed: $_" -Level ERROR
-    exit 1
+	#Now find the vhdx make sure its there
+	if (Test-Path "$MyVHDXPath")
+	{
+		Log "The VHDX file was found in the store.  We will proceed to remove the old VHD and add the VHDX"
+	}
+	else
+	{
+		Log "***The vhdx file was NOT found in the store.  Exiting the Script the VHD is still in place."
+		Log "========================================================================"
+		FormatErrors
+		Log "========================================================================"
+
+		Exit
+	}
+
+	Log "Getting Disk Locator for the original VHD"
+    $VHD_DiskLocator = Get-PvsDiskLocator -DiskLocatorId $diskLocatorId
+	
+	$dl_Name = $VHD_DiskLocator.Name 
+	$dl_Site = $VHD_DiskLocator.SiteName
+	$dl_Store = $VHD_DiskLocator.StoreName
+	$dl_Description = $VHD_DiskLocator.Description
+	$dl_MenuText = $VHD_DiskLocator.MenuText
+	$dl_ServerName = $VHD_DiskLocator.ServerName
+	$dl_RebalanceEnabled = $VHD_DiskLocator.RebalanceEnabled
+	$dl_RebalanceEnabledPercent = $VHD_DiskLocator.RebalanceTriggerPercent
+	$dl_SubnetAffinity = $VHD_DiskLocator.SubnetAffinity
+	
+	#Delete the original disklocator
+	Remove-PvsDiskLocator -DiskLocatorId $diskLocatorId -DeleteDiskFile -Confirm:$false
+	
+	#Now delete the vhd file
+    Log "Changing to directory: $storePath"
+    Push-Location $storePath -StackName $LOCATION_STACK_NAME
+	
+	#Now  add the new one
+	Log "Creating a disk locator for our VHDX file"
+
+	if ($dl_MenuText -eq $null){$dl_MenuText=""}
+	if ($dl_Description -eq $null){$dl_Description=""}
+	if ($dl_ServerName -eq $null){$dl_ServerName=""}
+	
+	log "dl_name [$dl_Name]"
+	log "dl_site [$dl_Site]"
+	log "dl_store [$dl_Store]"
+	Log "dl_ServerName [$dl_ServerName]"
+	log "dl_description [$dl_Description ]"
+	log "dl_menutest [$dl_MenuText ]"
+	log "dl_RebalanceEnabled [$dl_RebalanceEnabled]"
+	log "dl_RebalanceEnabledPercent [$dl_RebalanceEnabledPercent]"
+	log "sl_SubnetAffinity [$dl_SubnetAffinity]"
+	
+	if ($dl_ServerName -eq "")
+	{
+		New-PvsDiskLocator `
+		-DiskLocatorName "$dl_Name" `
+		-SiteName "$dl_Site" `
+		-StoreName "$dl_Store" `
+		-VHDX 
+	}
+	else
+	{
+		New-PvsDiskLocator `
+		-DiskLocatorName "$dl_Name" `
+		-SiteName "$dl_Site" `
+		-StoreName "$dl_Store" `
+		-ServerName "$dl_ServerName" `
+		-VHDX 
+	}
+	if (!($?))
+	{
+		Log "We were not able to imported the vDisk after converting to VHDX -- exiting script"
+		Log "========================================================================"
+		FormatErrors
+		Log "========================================================================"
+		Exit
+	}
+	
+	$NewVHDX_DiskLocator = Get-PvsDiskLocator -DiskLocatorName "$dl_Name" -SiteName "$dl_Site" -StoreName "$dl_Store"
+	$newDiskLocatorId = $NewVHDX_DiskLocator.DiskLocatorId
+	Log "The new DiskLocator Id for the VHDX file is $newDiskLocatorId"
+	$storePath = (Get-PvsStore -StoreId $VHD_DiskLocator.StoreId).Path
+	
+	$o = Get-PvsDisk -DiskLocatorId $newDiskLocatorId
+	$o.ActivationDateEnabled = $VD_ActivationEnabled 
+	$o.HaEnabled = $VD_HAEnabled 
+	$o.AdPasswordEnabled = $VD_ADPasswordEnabled 
+	$o.PrinterManagementEnabled = $VD_PrinterManagementEnabled 
+	$o.WriteCacheType = $VD_WritecacheType 
+	$o.WriteCacheSize = $VD_WriteCacheSize 
+	$o.LicenseMode = $VD_LicenseMode 
+	$o.VHDX = $true
+	#Change the disk to use the new disk locator
+	Set-PvsDisk $o 
+
+	#Check to make sure it changed
+	$NewDiskAfterChange = Get-PvsDisk -DiskLocatorId $NewVHDX_DiskLocator.DiskLocatorId
+	$OriginalFileNew = $NewDiskAfterChange.OriginalFile
+	if ($OriginalFileNew -eq $null){$OriginalFileNew = ""}
+	if (!($OriginalFileNew.Contains(".")))
+	{
+		Log "We were not able to find the imported vDisk after converting to VHDX -- exiting script"
+		Log "========================================================================"
+		FormatErrors
+		Log "========================================================================"
+		Exit
+	}
+	
+	if ($OriginalFileNew -ne $MyVHDXPath)
+	{
+		#We failed
+		Log "The new VHDX vDisk was not able to be assigned to the existing pvp file.  Please remove the vDIsk and add it back in using the VHDX file"
+		Log "========================================================================"
+		FormatErrors
+		Log "========================================================================"
+		Exit
+	}
+	else
+	{
+		#We succeeded
+		Log "Success - The new VHDX vDisk was  assigned to the existing pvp file."
+	}
+	
+    Log "The VHD vDisk was successfully converted to a VHDX vDisk"
+	
+	Pop-Location -StackName $LOCATION_STACK_NAME -ErrorAction SilentlyContinue
+	
+	$diskLocatorId = $newDiskLocatorId
 }
+elseif ($bConvertToVHDX -and $VHD_EXTENSION -eq "vhdx")
+{
+    Log "File is already in VHDX format, skipping conversion."
+}
+
+Start-Sleep 60
+
+If ($bUSE_Versioning)
+	{
+		Log "Using vDisk Versioning"
+		Log "Searching for new disk locator with Id $diskLocatorId"
+	    $VHDX_DiskLocator = Get-PvsDiskLocator -DiskLocatorId $diskLocatorId
+		
+	    Log "Changing to directory: $storePath"
+	    Push-Location $storePath -StackName $LOCATION_STACK_NAME
+		
+		
+		if($bUseImageNameAsvDiskName)
+		{
+		
+			#First lets see if there is a vDisk disklocator with our image name already
+			$siteId = $VHDX_DiskLocator.SiteId
+			$storID = $VHDX_DiskLocator.StoreId
+			$disklocatorTest = Get-PvsDiskLocator -DiskLocatorName "$imageName" -SiteId $siteId -StoreId $storID -ErrorAction:Ignore
+			if ($disklocatorTest -eq $null)
+			{
+				Log "No vDisk found matching our image name [$imageName].  This will be the first version."
+				#Now need to remove the vDisk, rename the vhd and add it back in to PVS.
+				$bRebaseVersion = $false
+				
+				Log "Getting Disk Locator for the original VHD"
+			    $VHD_DiskLocator = Get-PvsDiskLocator -DiskLocatorId $diskLocatorId
+				
+				$dl_Name = $imageName 
+				$dl_Site = $VHD_DiskLocator.SiteName
+				$dl_Store = $VHD_DiskLocator.StoreName
+				$dl_Description = $VHD_DiskLocator.Description
+				$dl_MenuText = $VHD_DiskLocator.MenuText
+				$dl_ServerName = $VHD_DiskLocator.ServerName
+				$dl_RebalanceEnabled = $VHD_DiskLocator.RebalanceEnabled
+				$dl_RebalanceEnabledPercent = $VHD_DiskLocator.RebalanceTriggerPercent
+				$dl_SubnetAffinity = $VHD_DiskLocator.SubnetAffinity
+				
+				#Delete the original disklocator
+				Log "Removing the Disk Locator with ID $diskLocatorId"
+				Remove-PvsDiskLocator -DiskLocatorId $diskLocatorId -Confirm:$false
+				
+				#Delete the PVP and lok files
+				$delFileBase = $VHD_DiskLocator.DiskLocatorName
+				Log "Removing $storePath\$delFileBase.lok"
+				Remove-Item "$storePath\$delFileBase.lok"
+				Log "Removing $storePath\$delFileBase.pvp"
+				Remove-Item "$storePath\$delFileBase.pvp"
+				
+				#Now rename the vhd file to imagename.vhd or imagename.vhdx
+			    Log "Changing to directory: $storePath"
+			    Push-Location $storePath -StackName $LOCATION_STACK_NAME
+				if ($bConvertToVHDX){$VHDEXT = "vhdx"}else{$VHDEXT = "vhd"}
+				$MyNewDiskPath = "$storePath\$imageName.$VHDEXT"
+				
+				if ($bConvertToVHDX)
+				{
+					Log "Renaming the disk file from [$MyVHDXpath] to [$MyNewDiskPath]"
+					ren $MyVHDXpath $MyNewDiskPath
+				}
+				else
+				{
+					Log "Renaming the disk file from [$MyVHDpath] to [$MyNewDiskPath]"
+					ren $MyVHDpath $MyNewDiskPath
+				}
+				#Make sure the rename worked
+				if (!(Test-Path $MyNewDiskPath))
+				{
+					Log "***Warning the rename failed.  Exiting Script"
+					Log "Try manually impporting the vDisk"
+					Log "========================================================================"
+					FormatErrors
+					Log "========================================================================"
+
+					Exit
+				}
+				
+				#Now  add the new one
+				Log "Creating a disk locator for our VHD/VHDX file"
+
+				if ($dl_MenuText -eq $null){$dl_MenuText=""}
+				if ($dl_Description -eq $null){$dl_Description=""}
+				if ($dl_ServerName -eq $null){$dl_ServerName=""}
+				if ($bConvertToVHDX)
+				{
+					if ($dl_ServerName -eq "")
+					{
+						New-PvsDiskLocator `
+						-DiskLocatorName "$dl_Name" `
+						-SiteName "$dl_Site" `
+						-StoreName "$dl_Store" `
+						-VHDX 
+						$VHDEXT = "vhdx"
+					}
+					else
+					{
+						New-PvsDiskLocator `
+						-DiskLocatorName "$dl_Name" `
+						-SiteName "$dl_Site" `
+						-StoreName "$dl_Store" `
+						-ServerName "$dl_ServerName" `
+						-VHDX 
+						$VHDEXT = "vhdx"
+					}
+				}
+				else
+				{
+				New-PvsDiskLocator `
+					-DiskLocatorName "$dl_Name" `
+					-SiteName "$dl_Site" `
+					-StoreName "$dl_Store" `
+					-ServerName "$dl_ServerName" 
+					$VHDEXT = "vhd"
+				}
+				if (!($?))
+				{
+					Log "***Warning the new disk created for our image was could not be added as a vDisk.  Exiting Script"
+					Log "using settings dl_name:$dl_Name dl_site:$dl_Site dl_store:$dl_store dl_server:$dl_ServerName"
+					
+					Log "Try manually impporting the vDisk"
+					Log "========================================================================"
+					FormatErrors
+					Log "========================================================================"
+
+					Exit
+				}
+				
+				$NewDiskLocator = Get-PvsDiskLocator -DiskLocatorName $dl_Name -SiteName $dl_Site -StoreName $dl_Store
+				$newDiskLocatorId = $NewDiskLocator.DiskLocatorId
+				Log "The new DiskLocator Id for the renamed image [$imageName] is $newDiskLocatorId"
+				$storePath = (Get-PvsStore -StoreId $NewDiskLocator.StoreId).Path
+				
+				$o = Get-PvsDisk -DiskLocatorId $newDiskLocatorId
+				$o.ActivationDateEnabled = $VD_ActivationEnabled 
+				$o.HaEnabled = $VD_HAEnabled 
+				$o.AdPasswordEnabled = $VD_ADPasswordEnabled 
+				$o.PrinterManagementEnabled = $VD_PrinterManagementEnabled 
+				$o.WriteCacheType = $VD_WritecacheType 
+				$o.WriteCacheSize = $VD_WriteCacheSize 
+				$o.LicenseMode = $VD_LicenseMode
+				if ($bConvertToVHDX)
+				{
+					$o.VHDX = $true
+				}
+				
+				#get the vhd/vhdx path
+				$OriginalFileO = $o.OriginalFile
+				if ($OriginalFileO -eq $null){$OriginalFileO = $o.OriginalFile}
+				if ($OriginalFileO -eq $null){$OriginalFileO = ""}
+				if (!($OriginalFileO.Contains(".")))
+				{
+					Log "We were not able to find the imported vDisk after the VHDX conversion -- exiting script"
+					Log "========================================================================"
+					FormatErrors
+					Log "========================================================================"
+					Exit
+				}
+				
+				Log "We will now update the vDisk settinsg to match previous settings"
+				#Change the disk to use the new disk locator
+				Set-PvsDisk $o 
+
+				#Check to make sure it changed
+				$NewDiskAfterChange2 = Get-PvsDisk -DiskLocatorId $NewDiskLocator.DiskLocatorId
+				Log "Checking new path for VHDXPath [$MyVHDXPath]"
+				
+				$OriginalFileNew2 = $NewDiskAfterChange2.OriginalFile
+				if ($OriginalFileNew2 -eq $null){$OriginalFileNew2 = ""}
+				if (!($OriginalFileNew2.Contains(".")))
+				{
+					Log "We were not able to find the vDisk after converting to VHDX -- exiting script"
+					Log "========================================================================"
+					FormatErrors
+					Log "========================================================================"
+					Exit					
+				}
+				
+				Log "Internal Name:$OriginalFileNew2"
+				if ($OriginalFileNew2 -ne $MyVHDXPath)
+				{
+					#We failed
+					Log "The vDisk was imported as $OriginalFileNew2.  Please remove the vDisk and add it back in"
+					Log "========================================================================"
+					FormatErrors
+					Log "========================================================================"
+
+					Exit
+				}
+				else
+				{
+					#We succeeded
+					Log "Success - The new vDisk was imported as $ImageName."
+				}
+				
+			}
+			else
+			{
+				$bRebaseVersion = $true
+				
+			}
+		}
+		else
+		{
+			$bRebaseVersion = $true
+		}
+		
+		if ($bRebaseVersion)
+		{
+			#We need to find the newest disk for our image
+			if ($bUseImageNameAsvDiskName)
+			{
+				$NewDiskBaseName = "$imageName"
+				$newestDisk = $NewDiskBaseName
+			}
+			else
+			{
+				$NewDiskBaseName = $VHDX_DiskLocator.Name
+				$latestTimeStamp = [DateTime]::MinValue
+			    $newestDisk = $null
+
+			    $dateTimeRegex = "_([0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2})$"
+			    $newDiskPrefix = $NewDiskBaseName -replace $dateTimeRegex,""
+
+			    Log "Searching for the latest disk that begins with $newDiskPrefix."
+
+			    ForEach ($file in (Get-ChildItem -Filter "*.vhd*")) {
+			        if ($file.BaseName -eq "$NewDiskBaseName") {
+			            Continue
+			        }
+
+					if ($file.BaseName -match "$($newDiskPrefix)$($dateTimeRegex)") {
+			            $timeStamp = [DateTime]::ParseExact($Matches[1], "yyyy-MM-dd_HH-mm-ss", $null)
+
+			            Log "Found '$($file.BaseName)'"
+
+			            if ($timeStamp -gt $latestTimeStamp) {
+			                $newestDisk = $file.BaseName
+			            }
+			        }
+			    }
+			}
+			
+			$existingDiskBaseName = $newestDisk
+		    if ($existingDiskBaseName -eq $null) {
+		        Log "No existing vDisk with a name similar to $($VHDX_DiskLocator.Name) was found, so a new version will not be added."
+				Log "========================================================================"
+				FormatErrors
+				Log "========================================================================"
+
+				Exit
+		    }
+		    
+			Log "Will add version to vDisk: $existingDiskBaseName"
+
+		    Export-PvsDisk -DiskLocatorId $VHDX_DiskLocator.DiskLocatorId
+
+		    $existingDiskLoc = Get-PvsDiskLocator -SiteId $VHDX_DiskLocator.SiteId -StoreId $VHDX_DiskLocator.StoreId -DiskLocatorName $existingDiskBaseName
+			
+			Log "Getting existing Disk Versions"
+		    $existingDiskVersions = Get-PvsDiskVersion -DiskLocatorId $existingDiskLoc.DiskLocatorId
+		    $nextVersionNum = ($existingDiskVersions | Measure -Property Version -Maximum).Maximum + 1
+
+			#Edit the disk manifest
+			$ManifestFile = "$($VHDX_DiskLocator.Name).xml"
+			
+		 	Log "Editing disk manifest file '$ManifestFile' to use version $NextVersionNum"
+
+		    [xml]$manifest = Get-Content -Path "$ManifestFile"
+
+			$newDesc = "Created from published disk $($manifest.versionManifest.version.diskFileName)"
+
+		    $manifest.versionManifest.version.type = "4"        # Merged Base - necessary so previous versions can be deleted
+		    $manifest.versionManifest.version.access = "7"      # Test - as opposed to Production (0) or Maintenance
+		    $manifest.versionManifest.version.versionNumber = "$NextVersionNum"
+		    if ($bConvertToVHDX)
+			{
+				$manifest.versionManifest.version.diskFileName = "$ExistingDiskBaseName.$NextVersionNum.vhdx"
+		    }
+			else
+			{
+				$manifest.versionManifest.version.diskFileName = "$ExistingDiskBaseName.$NextVersionNum.vhd"
+			}
+			$manifest.versionManifest.version.description = "$newDesc"
+
+		    $outPath = "$(Convert-Path -Path ".")\$ExistingDiskBaseName.xml"
+		    Log "Writing new disk manifest file '$outPath'"
+
+		    $manifest.Save($outPath)
+		    
+		    # TODO copy load balancing settings over
+		    $diskLocks = Get-PvsDiskLocatorLock -DiskLocatorId $existingDiskLoc.DiskLocatorId
+		    if ($diskLocks.Length -le 0) {
+		        Log "Copying configuration settings to existing vDisk: $existingDiskBaseName"
+
+		        $newDisk = Get-PvsDisk -DiskLocatorId $VHDX_DiskLocator.DiskLocatorId
+		        $existingDisk = Get-PvsDisk -DiskLocatorId $existingDiskLoc.DiskLocatorId
+
+		        $existingDisk.PrinterManagementEnabled = $newDisk.PrinterManagementEnabled
+		        $existingDisk.AdPasswordEnabled = $newDisk.AdPasswordEnabled
+		        $existingDisk.WriteCacheType = $newDisk.WriteCacheType
+		        $existingDisk.LicenseMode = $newDisk.LicenseMode
+				$OriginalFileED = $existingDisk.OriginalFile
+				if ($OriginalFileED -eq $null){$OriginalFileED = $existingDisk.OriginalFile}
+				if ($OriginalFileED -eq $null){$OriginalFileED = ""}
+				if (!($OriginalFileED.Contains(".")))
+				{
+					Log "We were not able to find the vDisk file name for versioning -- exiting script"
+					Log "========================================================================"
+					FormatErrors
+					Log "========================================================================"
+					Exit
+				}
+				$ExtTest = $OriginalFileED.substring($OriginalFileED.length-4,4)
+				if ($ExtTest -eq "vhdx")
+				{
+		        	Set-PvsDisk $existingDisk -VHDX
+				}
+				else
+				{
+					Set-PvsDisk $existingDisk
+				}
+		    } else {
+		        Log "WARNING: vDisk '$existingDiskBaseName' is locked, configuration settings will not be changed!"
+		    }
+			
+			Log "Removing the disk locator with id [" + $VHDX_DiskLocator.DiskLocatorId + "]"
+		    Remove-PvsDiskLocator -DiskLocatorId $VHDX_DiskLocator.DiskLocatorId
+
+		    #Now lets rename the pvp and vhdx to our version numbering naming scheme
+		    $NewDiskBaseName = $VHDX_DiskLocator.Name
+		    Log "Renaming vDisk files to use version number $NextVersionNum"
+
+		    Remove-Item "$NewDiskBaseName.lok"
+		    Remove-Item "$NewDiskBaseName.xml"
+		    Rename-Item "$NewDiskBaseName.pvp" "$ExistingDiskBaseName.$NextVersionNum.pvp"
+		    if ($bConvertToVHDX)
+			{
+				Rename-Item "$NewDiskBaseName.vhdx" "$ExistingDiskBaseName.$NextVersionNum.vhdx"
+			}
+			else
+			{
+				Rename-Item "$NewDiskBaseName.vhd" "$ExistingDiskBaseName.$NextVersionNum.vhd"
+			}
+					
+			Add-PvsDiskVersion -DiskLocatorId $existingDiskLoc.DiskLocatorId
+
+		    Log "vDisk $($VHDX_DiskLocator.Name) successfully converted to version $nextVersionNum of vDisk $existingDiskBaseName"
+
+		    Remove-Item "$existingDiskBaseName.xml" -ErrorAction Continue
+		}
+	}
+	
+	FormatErrors
+	Log "========================================================================"
