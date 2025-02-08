@@ -1,0 +1,177 @@
+<#
+.SYNOPSIS
+Скрипт для мониторинга PVS-устройств.
+
+.DESCRIPTION
+Этот скрипт получает информацию о PVS-устройствах, включая время работы и процессы с наибольшим количеством прочитанных данных.
+
+.PARAMETER SiteName
+Имя сайта PVS.
+
+.PARAMETER CollectionName
+Имя коллекции PVS.
+
+.PARAMETER LogFile
+Путь к файлу лога.
+
+.PARAMETER MaxThreads
+Максимальное количество потоков для асинхронной обработки.
+
+.EXAMPLE
+.\script.ps1 -SiteName "MySite" -CollectionName "MyCollection" -LogFile "C:\Logs\log.txt" -MaxThreads 15
+#>
+
+param (
+    [string]$SiteName = "<site>",
+    [string]$CollectionName = "<collection name>",
+    [string]$LogFile = "C:\Logs\PVS_Targets_Log.txt",
+    [int]$MaxThreads = 10
+)
+
+# Убедимся, что необходимые модули и компоненты доступны
+& "$($env:systemroot)\Microsoft.NET\Framework64\v4.0.30319\installutil.exe" "$($env:programfiles)\Citrix\Provisioning Services Console\Citrix.PVS.SnapIn.dll"
+Add-PSSnapin *PVS* -ErrorAction Stop
+
+# Функция для логирования
+function Log-Message {
+    param (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$Level] $Message"
+    Add-Content -Path $logFile -Value $logEntry
+    if ($Level -eq "ERROR") {
+        Write-Error $logEntry
+    } else {
+        Write-Output $logEntry
+    }
+}
+
+# Ротация логов (если файл старше 1 дня)
+if (Test-Path $logFile) {
+    $logFileCreationDate = (Get-Item $logFile).CreationTime
+    if ((Get-Date) - $logFileCreationDate -gt (New-TimeSpan -Days 1)) {
+        $archiveLogFile = "C:\Logs\PVS_Targets_Log_$(Get-Date -Format 'yyyyMMdd').txt"
+        Move-Item -Path $logFile -Destination $archiveLogFile
+        Log-Message "Старый лог-файл перемещен в $archiveLogFile."
+    }
+}
+
+# Создаем пул runspace для асинхронной обработки
+$runspacePool = [RunspaceFactory]::CreateRunspacePool(1, $MaxThreads)
+$runspacePool.Open()
+$runspaces = @()
+
+# Получаем список устройств
+try {
+    $targets = Get-PvsDevice -SiteName $SiteName -CollectionName $CollectionName | Select-Object DeviceName, DomainName
+    Log-Message "Получено $($targets.Count) устройств для обработки."
+} catch {
+    Log-Message "Ошибка при получении списка устройств: $_" -Level "ERROR"
+    exit 1
+}
+
+# Функция для обработки каждого устройства
+function Process-Target {
+    param (
+        [string]$TargetName
+    )
+    try {
+        # Проверка доступности устройства
+        if (-not (Test-Connection -ComputerName $TargetName -Count 2 -Quiet)) {
+            Log-Message "Устройство $TargetName недоступно." -Level "WARNING"
+            return
+        }
+
+        # Тайм-аут для операций
+        $timeout = 30 # Тайм-аут в секундах
+        $job = Start-Job -ScriptBlock {
+            param ($TargetName)
+            # Получаем информацию о процессах с наибольшим количеством прочитанных данных
+            $TopReads = Get-CimInstance -ComputerName $TargetName -ClassName Win32_Process | 
+                        Select-Object Name, ReadTransferCount | 
+                        Sort-Object -Property ReadTransferCount -Descending | 
+                        Select-Object -First 5
+            
+            # Получаем время работы системы
+            $osInfo = Get-CimInstance -ComputerName $TargetName -ClassName Win32_OperatingSystem
+            $Uptime = (Get-Date) - $osInfo.LastBootUpTime
+            
+            # Формируем результат
+            $result = "`nPVS target name:`t$TargetName`n"
+            $result += "Uptime: $($Uptime.Days) days, $($Uptime.Hours) hours, $($Uptime.Minutes) minutes`n"
+            $result += "Processes currently running with top reads in GB:`n"
+            
+            foreach ($read in $TopReads) {
+                $ProcessName = $read.Name.PadRight(25, ' ')
+                $ReadGB = [math]::Round($read.ReadTransferCount / 1GB, 3)
+                $result += "$ProcessName $ReadGB GB`n"
+            }
+            
+            return $result
+        } -ArgumentList $TargetName
+
+        if (Wait-Job $job -Timeout $timeout) {
+            $result = Receive-Job $job
+            Log-Message $result
+        } else {
+            Log-Message "Обработка устройства $TargetName превысила тайм-аут $timeout секунд." -Level "WARNING"
+            Stop-Job $job
+        }
+        Remove-Job $job
+    } catch {
+        Log-Message "Ошибка при обработке устройства $TargetName: $_" -Level "ERROR"
+    }
+}
+
+# Прогресс-бар
+$totalTargets = $targets.Count
+$processedTargets = 0
+
+# Запускаем обработку каждого устройства асинхронно
+foreach ($target in $targets) {
+    $TargetName = "$($target.DeviceName).$($target.DomainName)"
+    
+    # Ограничение количества одновременно выполняемых потоков
+    while ($runspaces.Count -ge $MaxThreads) {
+        $completed = $runspaces | Where-Object { $_.Status.IsCompleted -eq $true }
+        foreach ($runspace in $completed) {
+            $runspace.Pipe.EndInvoke($runspace.Status)
+            $runspace.Pipe.Dispose()
+            $runspaces.Remove($runspace)
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    # Создаем новый runspace
+    $powershell = [PowerShell]::Create().AddScript({
+        param ($TargetName)
+        Process-Target -TargetName $TargetName
+    }).AddArgument($TargetName)
+    
+    $powershell.RunspacePool = $runspacePool
+    $runspaces += [PSCustomObject]@{ Pipe = $powershell; Status = $powershell.BeginInvoke() }
+
+    # Обновляем прогресс-бар
+    $processedTargets++
+    $progress = [math]::Round(($processedTargets / $totalTargets) * 100, 2)
+    Write-Progress -Activity "Обработка устройств" -Status "Прогресс: $progress%" -PercentComplete $progress
+}
+
+# Ожидаем завершения всех runspaces
+while ($runspaces.Count -gt 0) {
+    $completed = $runspaces | Where-Object { $_.Status.IsCompleted -eq $true }
+    foreach ($runspace in $completed) {
+        $runspace.Pipe.EndInvoke($runspace.Status)
+        $runspace.Pipe.Dispose()
+        $runspaces.Remove($runspace)
+    }
+    Start-Sleep -Milliseconds 500
+}
+
+# Закрываем пул runspace
+$runspacePool.Close()
+$runspacePool.Dispose()
+
+Log-Message "Обработка завершена."
