@@ -16,7 +16,7 @@
 -CacheDurationMinutes: Время кэширования данных PVS в минутах (по умолчанию: 5, для больших ферм).
 
 .ПРИМЕРЫ
-.\Monitor-PVS_Universal_Optimized_LargeFarm_ErrorHandling_RU.ps1 -LogPath "D:\PVS_Logs" -RunTimeMinutes 45 -CacheDurationMinutes 10
+.\Monitor-PVS_Universal_Optimized_LargeFarm_ErrorHandling_RU_Final.ps1 -LogPath "D:\PVS_Logs" -RunTimeMinutes 45 -CacheDurationMinutes 10
 Запустит оптимизированный мониторинг для больших ферм с логами в D:\PVS_Logs, длительностью 45 минут и кэшированием данных на 10 минут.
 
 .ЗАМЕЧАНИЯ
@@ -70,7 +70,7 @@ $TextLogFile = "$LogFile.txt"
 
 # Создание CSV-файла с заголовками
 try {
-    "Timestamp,CPU_Usage_%,Processor_Queue,Available_Memory_MB,Cache_Bytes_MB,Copy_Read_Hits_%,L2_Bytes_Received_Mbps,L2_Bytes_Sent_Mbps,L3_Bytes_Received_Mbps,L3_Bytes_Sent_Mbps,Thread_Count,Disk_Reads_sec,Disk_Queue_Length,PVS_Server_Status,PVS_Threads,PVS_Cache_Usage,PVS_Device_Count,Server_Cores,Server_RAM_GB,Server_Network_Speed_Gbps,PVS_Version,Analysis" | 
+    "Timestamp,CPU_Usage_Percent,Processor_Queue,Available_Memory_MB,Cache_Bytes_MB,Copy_Read_Hits_Percent,L2_Bytes_Received_Mbps,L2_Bytes_Sent_Mbps,L3_Bytes_Received_Mbps,L3_Bytes_Sent_Mbps,Thread_Count,Disk_Reads_sec,Disk_Queue_Length,PVS_Server_Status,PVS_Threads,PVS_Cache_Usage,PVS_Device_Count,Server_Cores,Server_RAM_GB,Server_Network_Speed_Gbps,PVS_Version,Analysis" | 
     Out-File $LogFile -Encoding UTF8
 }
 catch {
@@ -211,11 +211,11 @@ function Get-PVSPerformanceMetrics {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $metrics = [PSCustomObject]@{
         Timestamp = $timestamp
-        CPU_Usage_% = 0
+        CPU_Usage_Percent = 0
         Processor_Queue = 0
         Available_Memory_MB = 0
         Cache_Bytes_MB = 0
-        Copy_Read_Hits_% = 0
+        Copy_Read_Hits_Percent = 0
         L2_Bytes_Received_Mbps = 0
         L2_Bytes_Sent_Mbps = 0
         L3_Bytes_Received_Mbps = 0
@@ -242,7 +242,7 @@ function Get-PVSPerformanceMetrics {
         # Мониторинг RAM, адаптировано под динамический объём RAM
         $availableMemory = (Get-Counter "\Memory\Available MBytes" -ErrorAction Stop).CounterSamples.CookedValue
         $cacheBytes = (Get-Counter "\Memory\Cache Bytes" -ErrorAction Stop).CounterSamples.CookedValue / 1MB  # В мегабайтах
-        $cacheHits = (Get-Counter "\Cache\Copy Read Hits %" -ErrorAction Stop).CounterSamples.CookedValue
+        $copyReadHits = (Get-Counter "\Cache\Copy Read Hits %" -ErrorAction Stop).CounterSamples.CookedValue  # Переименовано для консистентности
 
         # Мониторинг сети (L3 и L2), адаптировано под динамическую скорость сети
         if ($L3Adapter -and $L2Adapter) {
@@ -291,8 +291,8 @@ function Get-PVSPerformanceMetrics {
         if ($availableMemory -lt $memoryThreshold) {
             $analysis += "Нехватка доступной памяти ($availableMemory МБ) — увеличьте объём RAM."
         }
-        if ($cacheHits -lt $cacheHitsThreshold) {
-            $analysis += "Низкие кэш-хиты ($cacheHits%) — проверьте NetApp, Oplocks, RAM."
+        if ($copyReadHits -lt $cacheHitsThreshold) {
+            $analysis += "Низкие кэш-хиты ($copyReadHits%) — проверьте NetApp, Oplocks, RAM."
         }
         if ($l2Rx -lt $networkThreshold -or $l2Tx -lt $networkThreshold) {
             $analysis += "Низкий трафик L2 ($l2Rx/$l2Tx Мбит/с) — проверьте NetApp (SMB, SSD, Oplocks)."
@@ -342,11 +342,11 @@ function Get-PVSPerformanceMetrics {
         $analysisText = $analysis -join "; "
 
         # Обновление метрик
-        $metrics.CPU_Usage_% = [math]::Round($cpuUsage, 2)
+        $metrics.CPU_Usage_Percent = [math]::Round($cpuUsage, 2)
         $metrics.Processor_Queue = [math]::Round($processorQueue, 2)
         $metrics.Available_Memory_MB = [math]::Round($availableMemory, 2)
         $metrics.Cache_Bytes_MB = [math]::Round($cacheBytes, 2)
-        $metrics.Copy_Read_Hits_% = [math]::Round($cacheHits, 2)
+        $metrics.Copy_Read_Hits_Percent = [math]::Round($copyReadHits, 2)
         $metrics.L2_Bytes_Received_Mbps = [math]::Round($l2Rx, 2)
         $metrics.L2_Bytes_Sent_Mbps = [math]::Round($l2Tx, 2)
         $metrics.L3_Bytes_Received_Mbps = [math]::Round($l3Rx, 2)
@@ -366,10 +366,10 @@ function Get-PVSPerformanceMetrics {
 
         # Вывод в консоль на русском, оптимизирован для читаемости
         Write-Host "Метка времени: $timestamp"
-        Write-Host "Загрузка CPU: $($metrics.CPU_Usage_%)%"
+        Write-Host "Загрузка CPU: $($metrics.CPU_Usage_Percent)%"
         Write-Host "Доступная память: $($metrics.Available_Memory_MB) МБ"
         Write-Host "Кэшированная память: $($metrics.Cache_Bytes_MB) МБ"
-        Write-Host "Процент кэш-хитов: $($metrics.Copy_Read_Hits_%)%"
+        Write-Host "Процент кэш-хитов: $($metrics.Copy_Read_Hits_Percent)%"
         Write-Host "L2 Приём: $($metrics.L2_Bytes_Received_Mbps) Мбит/с, L2 Передача: $($metrics.L2_Bytes_Sent_Mbps) Мбит/с"
         Write-Host "L3 Приём: $($metrics.L3_Bytes_Received_Mbps) Мбит/с, L3 Передача: $($metrics.L3_Bytes_Sent_Mbps) Мбит/с"
         Write-Host "Количество потоков: $($metrics.Thread_Count)"
