@@ -58,8 +58,9 @@ Write-Report "`n=== Сетевые интерфейсы ==="
 $pvsServer = Get-PvsServer -Name $env:COMPUTERNAME -ErrorAction SilentlyContinue
 $streamingIp = if ($pvsServer -and $pvsServer.Ip) { $pvsServer.Ip } else { "Не определён" }
 
-# Получаем все сетевые интерфейсы с IP-адресами
-$nics = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true -and $_.IPAddress }
+# Получаем все сетевые интерфейсы с IP-адресами и фильтруем только активные
+$nics = Get-CimInstance Win32_NetworkAdapterConfiguration | 
+        Where-Object { $_.IPEnabled -eq $true -and $_.IPAddress -and $_.Description }
 
 foreach ($nic in $nics) {
     try {
@@ -71,28 +72,55 @@ foreach ($nic in $nics) {
         $nicBytesPerSec = 0
         $nicErrors = 0
         try {
-            # Экранируем описание интерфейса для корректной работы с Get-Counter
-            $escapedDesc = $nicDesc -replace '[^\w\s]', '' -replace '\s+', ' '
+            # Экранируем и нормализуем описание интерфейса для корректной работы с Get-Counter
+            $escapedDesc = $nicDesc -replace '[^a-zA-Z0-9\s#]', '' -replace '\s+', ' ' -replace '#', ' '
             $counterPathBytes = "\Network Interface($escapedDesc)\Bytes Total/sec"
             $counterPathErrors = "\Network Interface($escapedDesc)\Packets Received Errors"
             
-            $nicStats = Get-Counter -Counter $counterPathBytes -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
-            if ($nicStats.CounterSamples -and $nicStats.CounterSamples.CookedValue) {
-                $nicBytesPerSec = [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1MB, 2)
-            }
-            
-            $errorsStats = Get-Counter -Counter $counterPathErrors -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
-            if ($errorsStats.CounterSamples -and $errorsStats.CounterSamples.CookedValue) {
-                $nicErrors = [math]::Round(($errorsStats.CounterSamples.CookedValue | Measure-Object -Average).Average, 2)
+            # Проверяем, существует ли счётчик, перед выполнением Get-Counter
+            $counterExists = Get-Counter -ListSet "Network Interface" -ErrorAction SilentlyContinue | 
+                            ForEach-Object { $_.PathsWithInstances } | 
+                            Where-Object { $_ -like "*$escapedDesc*" }
+            if ($counterExists) {
+                $nicStats = Get-Counter -Counter $counterPathBytes -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+                if ($nicStats.CounterSamples -and $nicStats.CounterSamples.CookedValue) {
+                    $nicBytesPerSec = [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1MB, 2)
+                }
+                
+                $errorsStats = Get-Counter -Counter $counterPathErrors -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+                if ($errorsStats.CounterSamples -and $errorsStats.CounterSamples.CookedValue) {
+                    $nicErrors = [math]::Round(($errorsStats.CounterSamples.CookedValue | Measure-Object -Average).Average, 2)
+                }
+            } else {
+                Write-Report "ПРЕДУПРЕЖДЕНИЕ: Счётчик не найден для NIC $nicDesc, используется резервный метод"
             }
         } catch {
             Write-Report "ПРЕДУПРЕЖДЕНИЕ: Не удалось получить данные сети через Get-Counter для NIC $nicDesc, используется резервный метод"
-            # Резервный метод через WMI (как в скриптах Guy Leech)
-            $wmiNet = Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface -Filter "Name='$($nicDesc)'" -ErrorAction SilentlyContinue
-            if ($wmiNet) {
-                $nicBytesPerSec = [math]::Round($wmiNet.BytesTotalPersec / 1MB, 2)
-                $nicErrors = [math]::Round($wmiNet.PacketsReceivedErrors, 2)
-            } else {
+        }
+        
+        # Резервный метод через WMI (проверяем несколько вариантов)
+        if ($nicBytesPerSec -eq 0 -or $nicErrors -eq 0) {
+            try {
+                # Пробуем найти данные через Win32_PerfFormattedData_Tcpip_NetworkInterface
+                $wmiNet = Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface -Filter "Name='$($nicDesc)'" -ErrorAction SilentlyContinue
+                if (-not $wmiNet) {
+                    # Альтернативный фильтр, если имя не совпадает
+                    $wmiNet = Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface -ErrorAction SilentlyContinue | 
+                              Where-Object { $_.Name -like "*$($nicDesc)*" }
+                }
+                if ($wmiNet) {
+                    $nicBytesPerSec = [math]::Round($wmiNet.BytesTotalPersec / 1MB, 2)
+                    $nicErrors = [math]::Round($wmiNet.PacketsReceivedErrors, 2)
+                } else {
+                    # Ещё один резервный метод через Win32_NetworkAdapter
+                    $adapter = Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.Name -like "*$($nicDesc)*" }
+                    if ($adapter) {
+                        Write-Report "ПРЕДУПРЕЖДЕНИЕ: Используется базовый метод через Win32_NetworkAdapter для NIC $nicDesc"
+                        $nicBytesPerSec = 0 # Без точных данных, только индикация
+                        $nicErrors = 0
+                    }
+                }
+            } catch {
                 Write-Report "ПРЕДУПРЕЖДЕНИЕ: Резервный метод через WMI также не сработал для NIC $nicDesc"
             }
         }
@@ -121,7 +149,7 @@ foreach ($nic in $nics) {
         }
         if ($nicErrors -gt 0) { Write-Report "  ВНИМАНИЕ: Обнаружены ошибки сети - потенциальное узкое место" }
         
-        $mtu = (Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.Description -eq $nicDesc }).MTU
+        $mtu = (Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.Description -eq $nicDesc -or $_.Name -like "*$nicDesc*" }).MTU
         if ($mtu) { Write-Report "  MTU: $mtu" }
     } catch {
         Write-Report "ОШИБКА: Не удалось собрать данные для NIC $nicDesc - $($_.Exception.Message)"
