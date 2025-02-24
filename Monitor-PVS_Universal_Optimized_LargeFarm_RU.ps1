@@ -1,31 +1,31 @@
 <#
 .SYNOPSIS
-Упрощённый скрипт для мониторинга производительности сервера с проверкой ошибок PVS в Event Viewer.
+Упрощённый скрипт для мониторинга производительности сервера с учётом vDisk на CIFS.
 
 .DESCRIPTION
 Данный скрипт автоматически определяет конфигурацию сервера (количество ядер, RAM),
-собирает базовые метрики производительности (CPU, RAM, кэш, потоки, I/O),
-проверяет логи Event Viewer на ошибки PVS, выводит результаты в консоль на русском языке и сохраняет их в CSV и текстовый файл.
+собирает базовые метрики производительности (CPU, RAM, кэш, потоки, I/O, сеть),
+учитывает, что vDisk находится на CIFS, выводит результаты в консоль на русском языке и сохраняет их в CSV и текстовый файл.
 
 .ПАРАМЕТРЫ
--LogPath: Путь для сохранения логов (по умолчанию: "C:\PVS_Logs").
+-LogPath: Путь для сохранения логов (по умолчанию: "C:\Server_Logs").
 -SampleInterval: Интервал сбора данных в секундах (по умолчанию: 10).
 -RunTimeMinutes: Время работы скрипта в минутах (по умолчанию: 30).
 
 .ПРИМЕРЫ
-.\Monitor_Server_Simplified_RU_Fixed.ps1 -LogPath "D:\PVS_Logs" -SampleInterval 15 -RunTimeMinutes 45
-Запустит упрощённый мониторинг с логами в D:\PVS_Logs, интервалом 15 секунд и длительностью 45 минут.
+.\Monitor_Server_Simplified_RU_CIFS.ps1 -LogPath "D:\Server_Logs" -SampleInterval 15 -RunTimeMinutes 45
+Запустит упрощённый мониторинг с логами в D:\Server_Logs, интервалом 15 секунд и длительностью 45 минут.
 
 .ЗАМЕЧАНИЯ
-- Требуются права администратора для работы с PerfMon и Event Viewer.
-- Скрипт проверяет журналы "Application" и "System" на события от Citrix PVS.
+- Требуются права администратора для работы с PerfMon.
+- Счётчики сети косвенно указывают на I/O для vDisk на CIFS, но не дают точной информации о производительности SMB/CIFS.
 #>
 
 # Параметры скрипта
 Param (
-    [string]$LogPath = "C:\PVS_Logs", # Путь для логов
-    [int]$SampleInterval = 10,        # Интервал сбора данных в секундах
-    [int]$RunTimeMinutes = 30         # Время работы скрипта в минутах
+    [string]$LogPath = "C:\Server_Logs", # Путь для логов
+    [int]$SampleInterval = 10,           # Интервал сбора данных в секундах
+    [int]$RunTimeMinutes = 30            # Время работы скрипта в минутах
 )
 
 # Создание директории логов, если её нет
@@ -39,7 +39,7 @@ $LogFile = Join-Path $LogPath "Server_Performance_Log_$(Get-Date -Format 'yyyyMM
 $TextLogFile = "$LogFile.txt"
 
 # Заголовки CSV
-"Timestamp,CPU_Usage_Percent,Available_Memory_MB,Cache_Bytes_MB,Copy_Read_Hits_Percent,Thread_Count,Disk_Reads_sec,Disk_Queue_Length,Server_Cores,Server_RAM_GB,Analysis" | 
+"Timestamp,CPU_Usage_Percent,Available_Memory_MB,Cache_Bytes_MB,Copy_Read_Hits_Percent,Thread_Count,Disk_Reads_sec,Disk_Queue_Length,Network_Bytes_Received_Mbps,Network_Bytes_Sent_Mbps,Server_Cores,Server_RAM_GB,Analysis" | 
 Out-File $LogFile -Encoding UTF8
 
 # Конфигурация сервера
@@ -51,6 +51,13 @@ $cpuThreshold = 70
 $memoryThreshold = 2000
 $cacheHitsThreshold = 80
 $diskQueueThreshold = 1
+$networkThreshold = 200  # Порог для сетевых операций (Мбит/с)
+
+# Определение сетевого интерфейса (основной, предполагается для CIFS)
+$networkAdapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
+if (!$networkAdapter) {
+    Write-Host "Предупреждение: Не найден активный сетевой интерфейс. Используются значения по умолчанию для сети (0 Мбит/с)." -ForegroundColor Yellow
+}
 
 # Функция мониторинга
 function Get-ServerPerformanceMetrics {
@@ -64,6 +71,8 @@ function Get-ServerPerformanceMetrics {
         Thread_Count = 0
         Disk_Reads_sec = 0
         Disk_Queue_Length = 0
+        Network_Bytes_Received_Mbps = 0
+        Network_Bytes_Sent_Mbps = 0
         Server_Cores = $serverCores
         Server_RAM_GB = $serverRAM
         Analysis = "Ошибка при сборе данных"
@@ -82,35 +91,31 @@ function Get-ServerPerformanceMetrics {
         $threadCount = (Get-Process -Name "StreamService" -ErrorAction SilentlyContinue).Threads.Count
         if (!$threadCount) { $threadCount = 0 }
 
-        # Мониторинг I/O к диску
+        # Мониторинг I/O к диску (локальный диск)
         $diskReads = (Get-Counter "\PhysicalDisk(_Total)\Disk Reads/sec" -ErrorAction Stop).CounterSamples.CookedValue
         $diskQueue = (Get-Counter "\PhysicalDisk(_Total)\Avg. Disk Queue Length" -ErrorAction Stop).CounterSamples.CookedValue
+
+        # Мониторинг сети (для CIFS, косвенно)
+        $networkBytesReceived = 0
+        $networkBytesSent = 0
+        if ($networkAdapter) {
+            try {
+                $networkBytesReceived = [math]::Round((Get-Counter "\Network Interface($($networkAdapter.Name))\Bytes Received/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8, 2)  # Мбит/с
+                $networkBytesSent = [math]::Round((Get-Counter "\Network Interface($($networkAdapter.Name))\Bytes Sent/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8, 2)  # Мбит/с
+            }
+            catch {
+                Write-Host "Предупреждение: Ошибка при мониторинге сети. Используются значения по умолчанию (0 Мбит/с)." -ForegroundColor Yellow
+            }
+        }
 
         # Анализ
         $analysis = @()
         if ($cpuUsage -gt $cpuThreshold) { $analysis += "Высокая загрузка CPU ($cpuUsage%)" }
         if ($availableMemory -lt $memoryThreshold) { $analysis += "Нехватка памяти ($availableMemory МБ)" }
         if ($copyReadHits -lt $cacheHitsThreshold) { $analysis += "Низкие кэш-хиты ($copyReadHits%)" }
-        if ($diskQueue -gt $diskQueueThreshold) { $analysis += "Высокая очередь I/O ($diskQueue)" }
-
-        # Проверка логов Event Viewer на ошибки PVS
-        try {
-            $eventErrors = @()
-            $pvsEvents = Get-WinEvent -LogName "Application", "System" -ErrorAction Stop | 
-                         Where-Object { 
-                             ($_.ProviderName -like "*Citrix PVS*" -or $_.Id -in 1000..1999) -and 
-                             ($_.Level -eq 2 -or $_.Level -eq 3)  # Уровни: Error (2), Warning (3)
-                         } | 
-                         Select-Object -Last 5
-            if ($pvsEvents) {
-                foreach ($event in $pvsEvents) {
-                    $eventErrors += "Журнал: $($event.LogName), ID: $($event.Id), Время: $($event.TimeCreated), Сообщение: $($event.Message)"
-                }
-                $analysis += "Найдены ошибки PVS: $($eventErrors -join '; ')"
-            }
-        }
-        catch {
-            $analysis += "Ошибка при доступе к Event Viewer: Не удалось получить события PVS."
+        if ($diskQueue -gt $diskQueueThreshold) { $analysis += "Высокая очередь I/O локального диска ($diskQueue)" }
+        if ($networkBytesReceived -lt $networkThreshold -or $networkBytesSent -lt $networkThreshold) { 
+            $analysis += "Низкий сетевой трафик ($networkBytesReceived/$networkBytesSent Мбит/с) — возможно, проблемы с CIFS." 
         }
 
         if ($analysis.Count -eq 0) { $analysis += "Производительность в норме." }
@@ -124,6 +129,8 @@ function Get-ServerPerformanceMetrics {
         $metrics.Thread_Count = $threadCount
         $metrics.Disk_Reads_sec = [math]::Round($diskReads, 2)
         $metrics.Disk_Queue_Length = [math]::Round($diskQueue, 2)
+        $metrics.Network_Bytes_Received_Mbps = $networkBytesReceived
+        $metrics.Network_Bytes_Sent_Mbps = $networkBytesSent
         $metrics.Analysis = $analysisText
 
         # Вывод в консоль
@@ -134,6 +141,7 @@ function Get-ServerPerformanceMetrics {
         Write-Host "Кэш-хиты: $($metrics.Copy_Read_Hits_Percent)%"
         Write-Host "Потоки: $($metrics.Thread_Count)"
         Write-Host "Чтения с диска/с: $($metrics.Disk_Reads_sec), Очередь: $($metrics.Disk_Queue_Length)"
+        Write-Host "Сеть (CIFS): Приём: $($metrics.Network_Bytes_Received_Mbps) Мбит/с, Передача: $($metrics.Network_Bytes_Sent_Mbps) Мбит/с"
         Write-Host "Ядра: $($metrics.Server_Cores), RAM: $($metrics.Server_RAM_GB) ГБ"
         Write-Host "Анализ: $analysisText"
         Write-Host "---"
