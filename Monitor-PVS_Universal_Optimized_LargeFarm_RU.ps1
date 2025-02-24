@@ -26,10 +26,20 @@ function Write-Report {
 # 1. Проверка состояния текущего сервера
 Write-Report "`n=== Состояние сервера ==="
 try {
-    $cpuSamples = Get-Counter -Counter "\Processor(_Total)\% Processor Time" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
-    $cpu = if ($cpuSamples.CounterSamples -and $cpuSamples.CounterSamples.CookedValue) {
-        [math]::Round(($cpuSamples.CounterSamples.CookedValue | Measure-Object -Average).Average, 2)
-    } else { 0 }
+    # Попробуем получить CPU через Get-Counter
+    $cpu = 0
+    try {
+        $cpuSamples = Get-Counter -Counter "\Processor(_Total)\% Processor Time" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+        if ($cpuSamples.CounterSamples -and $cpuSamples.CounterSamples.CookedValue) {
+            $cpu = [math]::Round(($cpuSamples.CounterSamples.CookedValue | Measure-Object -Average).Average, 2)
+        }
+    } catch {
+        Write-Report "ПРЕДУПРЕЖДЕНИЕ: Не удалось получить данные CPU через Get-Counter, используется резервный метод"
+        # Резервный метод через WMI (как в скриптах Guy Leech)
+        $cpuWmi = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -ErrorAction SilentlyContinue | 
+                  Measure-Object -Property PercentProcessorTime -Average | Select-Object -ExpandProperty Average
+        if ($cpuWmi) { $cpu = [math]::Round($cpuWmi, 2) }
+    }
     
     $memory = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
     $memoryUsed = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1MB, 2)
@@ -53,16 +63,29 @@ foreach ($nic in $nics) {
     try {
         $nicIp = $nic.IPAddress -join ", " # Обработка массива IP-адресов
         $nicDesc = $nic.Description
-        $nicStats = Get-Counter -Counter "\Network Interface($nicDesc)\Bytes Total/sec" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
-        $nicBytesPerSec = if ($nicStats.CounterSamples -and $nicStats.CounterSamples.CookedValue) {
-            [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1MB, 2)
-        } else { 0 }
         
-        $nicErrors = if ($nicStats.CounterSamples) {
-            Get-Counter -Counter "\Network Interface($nicDesc)\Packets Received Errors" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop | 
-            ForEach-Object { if ($_.CounterSamples -and $_.CounterSamples.CookedValue) { [math]::Round($_.CounterSamples.CookedValue, 2) } else { 0 } } | 
-            Measure-Object -Average | Select-Object -ExpandProperty Average
-        } else { 0 }
+        # Попробуем получить данные через Get-Counter
+        $nicBytesPerSec = 0
+        $nicErrors = 0
+        try {
+            $nicStats = Get-Counter -Counter "\Network Interface($nicDesc)\Bytes Total/sec" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+            if ($nicStats.CounterSamples -and $nicStats.CounterSamples.CookedValue) {
+                $nicBytesPerSec = [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1MB, 2)
+            }
+            
+            $errorsStats = Get-Counter -Counter "\Network Interface($nicDesc)\Packets Received Errors" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+            if ($errorsStats.CounterSamples -and $errorsStats.CounterSamples.CookedValue) {
+                $nicErrors = [math]::Round(($errorsStats.CounterSamples.CookedValue | Measure-Object -Average).Average, 2)
+            }
+        } catch {
+            Write-Report "ПРЕДУПРЕЖДЕНИЕ: Не удалось получить данные сети через Get-Counter для NIC $nicDesc, используется резервный метод"
+            # Резервный метод через WMI (как в скриптах Guy Leech)
+            $wmiNet = Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface -Filter "Name='$nicDesc'" -ErrorAction SilentlyContinue
+            if ($wmiNet) {
+                $nicBytesPerSec = [math]::Round($wmiNet.BytesTotalPersec / 1MB, 2)
+                $nicErrors = [math]::Round($wmiNet.PacketsReceivedErrors, 2)
+            }
+        }
         
         Write-Report "NIC: $nicDesc | IP: $nicIp | Трафик: $nicBytesPerSec MB/s | Ошибки: $nicErrors/с"
         if ($nicIp -like "*$streamingIp*") {
@@ -88,8 +111,12 @@ if ($pvsServer) {
         $udpPorts = $pvsServer.FirstPort..$pvsServer.LastPort
         $deviceCount = 0
         foreach ($port in $udpPorts) {
-            $connections = Get-NetUDPEndpoint -LocalPort $port -ErrorAction SilentlyContinue
-            if ($connections) { $deviceCount += $connections.Count }
+            # Проверяем доступность порта с помощью Test-NetConnection (если PowerShell 4.0+)
+            $connection = Test-NetConnection -Port $port -ErrorAction SilentlyContinue
+            if ($connection.TcpTestSucceeded) {
+                $connections = Get-NetUDPEndpoint -LocalPort $port -ErrorAction SilentlyContinue
+                if ($connections) { $deviceCount += $connections.Count }
+            }
         }
         Write-Report "Порты стриминга: $($pvsServer.FirstPort)-$($pvsServer.LastPort)"
         Write-Report "Подключённых устройств: $deviceCount"
@@ -105,36 +132,48 @@ if ($pvsServer) {
 Write-Report "`n=== vDisk Store текущего сервера ==="
 if ($pvsServer) {
     try {
-        # Получаем сайт текущего сервера
+        # Получаем ID сайта текущего сервера
         $siteId = $pvsServer.SiteId
         
-        # Находим Store, связанный с текущим сервером
-        $pvsStore = Get-PvsStore | Where-Object { 
-            (Get-PvsServerStore -StoreId $_.StoreId -ServerName $env:COMPUTERNAME -ErrorAction Stop).ServerName -contains $env:COMPUTERNAME 
-        } | Select-Object -First 1
-        
-        if ($pvsStore) {
-            $storePath = $pvsStore.Path
-            Write-Report "Путь к vDisk Store: $storePath"
-            if (Test-Path -Path $storePath -ErrorAction Stop) {
-                try {
-                    $startTime = Get-Date
-                    $testFile = Join-Path $storePath "testfile_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-                    "Тест" | Out-File $testFile -Force -ErrorAction Stop
-                    $endTime = Get-Date
-                    $latency = [math]::Round(($endTime - $startTime).TotalMilliseconds, 2)
-                    Remove-Item $testFile -Force -ErrorAction SilentlyContinue
-                    Write-Report "Доступ: Успешно | Задержка: $latency мс"
-                    if ($latency -gt 100) { Write-Report "ВНИМАНИЕ: Высокая задержка доступа к хранилищу - узкое место" }
-                    elseif ($latency -gt 50) { Write-Report "ПРЕДУПРЕЖДЕНИЕ: Заметная задержка доступа" }
-                } catch {
-                    Write-Report "ОШИБКА: Не удалось выполнить тест доступа к $storePath - $($_.Exception.Message)"
+        # Получаем все Store, связанные с текущим сервером
+        $serverStores = Get-PvsServerStore -ServerName $env:COMPUTERNAME -ErrorAction SilentlyContinue
+        if ($serverStores -and $serverStores.StoreId) {
+            # Берем первый Store, связанный с сервером
+            $storeId = $serverStores[0].StoreId
+            $pvsStore = Get-PvsStore -StoreId $storeId -ErrorAction SilentlyContinue
+            
+            if ($pvsStore -and $pvsStore.Path) {
+                $storePath = $pvsStore.Path
+                Write-Report "Путь к vDisk Store: $storePath"
+                # Проверяем доступность пути через Test-Path с обработкой UNC-путей
+                if (Test-Path -Path $storePath -ErrorAction SilentlyContinue) {
+                    try {
+                        # Проверяем, есть ли права на запись, создавая временную директорию
+                        $testDir = Join-Path $storePath "test"
+                        if (-not (Test-Path $testDir -ErrorAction SilentlyContinue)) {
+                            New-Item -Path $testDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+                        }
+                        $startTime = Get-Date
+                        $testFile = Join-Path $testDir "testfile_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+                        "Тест" | Out-File $testFile -Force -ErrorAction SilentlyContinue
+                        $endTime = Get-Date
+                        $latency = [math]::Round(($endTime - $startTime).TotalMilliseconds, 2)
+                        Remove-Item $testFile -Force -ErrorAction SilentlyContinue
+                        Remove-Item $testDir -Force -ErrorAction SilentlyContinue
+                        Write-Report "Доступ: Успешно | Задержка: $latency мс"
+                        if ($latency -gt 100) { Write-Report "ВНИМАНИЕ: Высокая задержка доступа к хранилищу - узкое место" }
+                        elseif ($latency -gt 50) { Write-Report "ПРЕДУПРЕЖДЕНИЕ: Заметная задержка доступа" }
+                    } catch {
+                        Write-Report "ОШИБКА: Не удалось выполнить тест доступа к $storePath - $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-Report "ОШИБКА: Нет доступа к $storePath - критическое узкое место"
                 }
             } else {
-                Write-Report "ОШИБКА: Нет доступа к $storePath - критическое узкое место"
+                Write-Report "Не удалось найти vDisk Store для StoreId $storeId"
             }
         } else {
-            Write-Report "Не удалось определить vDisk Store текущего сервера"
+            Write-Report "Не удалось определить Store, связанные с текущим сервером"
         }
     } catch {
         Write-Report "ОШИБКА: Не удалось обработать Store - $($_.Exception.Message)"
