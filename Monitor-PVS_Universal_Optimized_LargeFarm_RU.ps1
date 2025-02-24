@@ -57,38 +57,62 @@ try {
 Write-Report "`n=== Сетевые интерфейсы ==="
 $pvsServer = Get-PvsServer -Name $env:COMPUTERNAME -ErrorAction SilentlyContinue
 $streamingIp = if ($pvsServer -and $pvsServer.Ip) { $pvsServer.Ip } else { "Не определён" }
-$nics = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true }
+
+# Получаем все сетевые интерфейсы с IP-адресами
+$nics = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true -and $_.IPAddress }
 
 foreach ($nic in $nics) {
     try {
-        $nicIp = $nic.IPAddress -join ", " # Обработка массива IP-адресов
+        # Получаем описание и IP-адреса интерфейса
         $nicDesc = $nic.Description
+        $nicIps = $nic.IPAddress -join ", " # Обработка массива IP-адресов
         
         # Попробуем получить данные через Get-Counter
         $nicBytesPerSec = 0
         $nicErrors = 0
         try {
-            $nicStats = Get-Counter -Counter "\Network Interface($nicDesc)\Bytes Total/sec" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+            # Экранируем описание интерфейса для корректной работы с Get-Counter
+            $escapedDesc = $nicDesc -replace '[^\w\s]', '' -replace '\s+', ' '
+            $counterPathBytes = "\Network Interface($escapedDesc)\Bytes Total/sec"
+            $counterPathErrors = "\Network Interface($escapedDesc)\Packets Received Errors"
+            
+            $nicStats = Get-Counter -Counter $counterPathBytes -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
             if ($nicStats.CounterSamples -and $nicStats.CounterSamples.CookedValue) {
                 $nicBytesPerSec = [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1MB, 2)
             }
             
-            $errorsStats = Get-Counter -Counter "\Network Interface($nicDesc)\Packets Received Errors" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+            $errorsStats = Get-Counter -Counter $counterPathErrors -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
             if ($errorsStats.CounterSamples -and $errorsStats.CounterSamples.CookedValue) {
                 $nicErrors = [math]::Round(($errorsStats.CounterSamples.CookedValue | Measure-Object -Average).Average, 2)
             }
         } catch {
             Write-Report "ПРЕДУПРЕЖДЕНИЕ: Не удалось получить данные сети через Get-Counter для NIC $nicDesc, используется резервный метод"
             # Резервный метод через WMI (как в скриптах Guy Leech)
-            $wmiNet = Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface -Filter "Name='$nicDesc'" -ErrorAction SilentlyContinue
+            $wmiNet = Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface -Filter "Name='$($nicDesc)'" -ErrorAction SilentlyContinue
             if ($wmiNet) {
                 $nicBytesPerSec = [math]::Round($wmiNet.BytesTotalPersec / 1MB, 2)
                 $nicErrors = [math]::Round($wmiNet.PacketsReceivedErrors, 2)
+            } else {
+                Write-Report "ПРЕДУПРЕЖДЕНИЕ: Резервный метод через WMI также не сработал для NIC $nicDesc"
             }
         }
         
-        Write-Report "NIC: $nicDesc | IP: $nicIp | Трафик: $nicBytesPerSec MB/s | Ошибки: $nicErrors/с"
-        if ($nicIp -like "*$streamingIp*") {
+        # Определяем, является ли интерфейс стримингом, сравнивая IP
+        $isStreamingNic = $false
+        if ($streamingIp -ne "Не определён") {
+            # Разбиваем IP на части для точного сравнения
+            $streamingIpParts = $streamingIp -split '\.'
+            foreach ($ip in ($nic.IPAddress | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' })) {
+                $nicIpParts = $ip -split '\.'
+                if ($streamingIpParts[0..2] -join '.' -eq $nicIpParts[0..2] -join '.') {
+                    $isStreamingNic = $true
+                    break
+                }
+            }
+        }
+        
+        Write-Report "NIC: $nicDesc | IP: $nicIps | Трафик: $nicBytesPerSec MB/s | Ошибки: $nicErrors/с"
+        if ($isStreamingNic) {
             Write-Report "  Используется для стриминга (L3)"
             if ($nicBytesPerSec -gt 900) { Write-Report "  ВНИМАНИЕ: Высокая нагрузка на стриминг - узкое место" }
         } else {
@@ -104,7 +128,7 @@ foreach ($nic in $nics) {
     }
 }
 
-# 4. Проверка доступа к vDisk Store текущего сервера
+# 3. Проверка доступа к vDisk Store текущего сервера
 Write-Report "`n=== vDisk Store текущего сервера ==="
 if ($pvsServer) {
     try {
@@ -158,7 +182,7 @@ if ($pvsServer) {
     Write-Report "Не удалось получить информацию о сервере"
 }
 
-# 5. Проверка настроек PVS
+# 4. Проверка настроек PVS
 Write-Report "`n=== Настройки PVS ==="
 $pvsService = Get-Service -Name "StreamService" -ErrorAction SilentlyContinue
 if ($pvsService -and $pvsService.Status -eq "Running") {
@@ -184,7 +208,7 @@ if ($pvsService -and $pvsService.Status -eq "Running") {
     Write-Report "ОШИБКА: Служба PVS не запущена - критическое узкое место"
 }
 
-# 6. Сохранение отчёта с проверкой пути
+# 5. Сохранение отчёта с проверкой пути
 try {
     $Report | Out-File $OutputFile -Encoding UTF8 -ErrorAction Stop
     Write-Report "`nОтчёт сохранён в $OutputFile"
