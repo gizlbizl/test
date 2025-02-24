@@ -13,7 +13,7 @@
 -RunTimeMinutes: Время работы скрипта в минутах (по умолчанию: 30).
 
 .ПРИМЕРЫ
-.\Monitor_Server_Simplified_RU.ps1 -LogPath "D:\PVS_Logs" -SampleInterval 15 -RunTimeMinutes 45
+.\Monitor_Server_Simplified_RU_Fixed.ps1 -LogPath "D:\PVS_Logs" -SampleInterval 15 -RunTimeMinutes 45
 Запустит упрощённый мониторинг с логами в D:\PVS_Logs, интервалом 15 секунд и длительностью 45 минут.
 
 .ЗАМЕЧАНИЯ
@@ -78,7 +78,7 @@ function Get-ServerPerformanceMetrics {
         $cacheBytes = (Get-Counter "\Memory\Cache Bytes" -ErrorAction Stop).CounterSamples.CookedValue / 1MB
         $copyReadHits = (Get-Counter "\Cache\Copy Read Hits %" -ErrorAction Stop).CounterSamples.CookedValue
 
-        # Мониторинг потоков (предполагается, что это сервер PVS, мониторим StreamService)
+        # Мониторинг потоков (предполагается сервер PVS, мониторим StreamService)
         $threadCount = (Get-Process -Name "StreamService" -ErrorAction SilentlyContinue).Threads.Count
         if (!$threadCount) { $threadCount = 0 }
 
@@ -154,7 +154,7 @@ $startTime = Get-Date
 
 Write-Host "Запуск мониторинга сервера на $RunTimeMinutes минут..." -ForegroundColor Green
 
-while ((Get-Date) - $startTime | Select-Object -ExpandProperty TotalSeconds -lt $runTimeSeconds) {
+while (((Get-Date) - $startTime).TotalSeconds -lt $runTimeSeconds) {
     Get-ServerPerformanceMetrics
     Start-Sleep -Seconds $SampleInterval
 }
