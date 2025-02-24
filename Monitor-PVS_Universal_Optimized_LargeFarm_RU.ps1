@@ -1,176 +1,132 @@
-<#
-.SYNOPSIS
-Упрощённый скрипт для мониторинга производительности сервера с учётом vDisk на CIFS.
+# Скрипт для анализа узких мест Citrix PVS 1912 на текущем сервере
+# Требуется модуль Citrix PVS SnapIn
+# Запуск с правами администратора на любом PVS-сервере
 
-.DESCRIPTION
-Данный скрипт автоматически определяет конфигурацию сервера (количество ядер, RAM),
-собирает базовые метрики производительности (CPU, RAM, кэш, потоки, I/O, сеть),
-учитывает, что vDisk находится на CIFS, выводит результаты в консоль на русском языке и сохраняет их в CSV и текстовый файл.
+# Импорт модуля PVS
+Add-PSSnapin Citrix.PVS.SnapIn -ErrorAction SilentlyContinue
 
-.ПАРАМЕТРЫ
--LogPath: Путь для сохранения логов (по умолчанию: "C:\Server_Logs").
--SampleInterval: Интервал сбора данных в секундах (по умолчанию: 10).
--RunTimeMinutes: Время работы скрипта в минутах (по умолчанию: 30).
+# Рекомендованные значения
+$RecommendedThreadsPerPort = 12
+$RecommendedBootPauseSeconds = 2
+$RecommendedMaxDevicesBooting = 200
+$RecommendedMtu = 9000
 
-.ПРИМЕРЫ
-.\Monitor_Server_Simplified_RU_CIFS.ps1 -LogPath "D:\Server_Logs" -SampleInterval 15 -RunTimeMinutes 45
-Запустит упрощённый мониторинг с логами в D:\Server_Logs, интервалом 15 секунд и длительностью 45 минут.
+# Инициализация отчёта
+$Report = @("Анализ узких мест Citrix PVS 1912 - $(Get-Date)", "Запущен на сервере: $env:COMPUTERNAME")
+$OutputFile = "C:\PVS_Analysis_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 
-.ЗАМЕЧАНИЯ
-- Требуются права администратора для работы с PerfMon.
-- Счётчики сети косвенно указывают на I/O для vDisk на CIFS, но не дают точной информации о производительности SMB/CIFS.
-#>
-
-# Параметры скрипта
-Param (
-    [string]$LogPath = "C:\Server_Logs", # Путь для логов
-    [int]$SampleInterval = 10,           # Интервал сбора данных в секундах
-    [int]$RunTimeMinutes = 30            # Время работы скрипта в минутах
-)
-
-# Создание директории логов, если её нет
-if (-not (Test-Path $LogPath)) {
-    New-Item -ItemType Directory -Path $LogPath | Out-Null
-    Write-Host "Создано директория для логов: $LogPath" -ForegroundColor Green
+# Функция для записи в отчёт
+function Write-Report {
+    param ([string]$Message)
+    Write-Host $Message
+    $script:Report += $Message
 }
 
-# Имена файлов логов
-$LogFile = Join-Path $LogPath "Server_Performance_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$TextLogFile = "$LogFile.txt"
+# 1. Проверка состояния текущего сервера
+Write-Report "`n=== Состояние сервера ==="
+$cpu = Get-Counter -Counter "\Processor(_Total)\% Processor Time" -SampleInterval 2 -MaxSamples 3 | 
+       Measure-Object -Property CookedValue -Average | Select-Object -ExpandProperty Average
+$memory = Get-CimInstance Win32_OperatingSystem
+$memoryUsed = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1024 / 1024, 2)
+$memoryTotal = [math]::Round($memory.TotalVisibleMemorySize / 1024 / 1024, 2)
 
-# Заголовки CSV
-"Timestamp,CPU_Usage_Percent,Available_Memory_MB,Cache_Bytes_MB,Copy_Read_Hits_Percent,Thread_Count,Disk_Reads_sec,Disk_Queue_Length,Network_Bytes_Received_Mbps,Network_Bytes_Sent_Mbps,Server_Cores,Server_RAM_GB,Analysis" | 
-Out-File $LogFile -Encoding UTF8
+Write-Report "CPU: $cpu% | Память: $memoryUsed GB / $memoryTotal GB"
+if ($cpu -gt 80) { Write-Report "ВНИМАНИЕ: Высокая нагрузка CPU - возможное узкое место" }
+if ($memoryUsed / $memoryTotal -gt 0.8) { Write-Report "ВНИМАНИЕ: Нехватка памяти - возможное узкое место" }
 
-# Конфигурация сервера
-$serverCores = (Get-WmiObject -Class Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum
-$serverRAM = [math]::Round((Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum / 1GB, 2)
+# 2. Анализ сетевых интерфейсов
+Write-Report "`n=== Сетевые интерфейсы ==="
+$pvsServer = Get-PvsServer -Name $env:COMPUTERNAME -ErrorAction SilentlyContinue
+$streamingIp = if ($pvsServer) { $pvsServer.Ip } else { "Не определён" }
+$nics = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true }
 
-# Пороги
-$cpuThreshold = 70
-$memoryThreshold = 2000
-$cacheHitsThreshold = 80
-$diskQueueThreshold = 1
-$networkThreshold = 200  # Порог для сетевых операций (Мбит/с)
-
-# Определение сетевого интерфейса (основной, предполагается для CIFS)
-$networkAdapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
-if (!$networkAdapter) {
-    Write-Host "Предупреждение: Не найден активный сетевой интерфейс. Используются значения по умолчанию для сети (0 Мбит/с)." -ForegroundColor Yellow
-}
-
-# Функция мониторинга
-function Get-ServerPerformanceMetrics {
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $metrics = [PSCustomObject]@{
-        Timestamp = $timestamp
-        CPU_Usage_Percent = 0
-        Available_Memory_MB = 0
-        Cache_Bytes_MB = 0
-        Copy_Read_Hits_Percent = 0
-        Thread_Count = 0
-        Disk_Reads_sec = 0
-        Disk_Queue_Length = 0
-        Network_Bytes_Received_Mbps = 0
-        Network_Bytes_Sent_Mbps = 0
-        Server_Cores = $serverCores
-        Server_RAM_GB = $serverRAM
-        Analysis = "Ошибка при сборе данных"
+foreach ($nic in $nics) {
+    $nicIp = $nic.IPAddress[0]
+    $nicStats = Get-Counter -Counter "\Network Interface($($nic.Description))\Bytes Total/sec" -SampleInterval 2 -MaxSamples 3
+    $nicBytesPerSec = [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1024 / 1024, 2)
+    
+    Write-Report "NIC: $($nic.Description) | IP: $nicIp | Трафик: $nicBytesPerSec MB/s"
+    if ($nicIp -eq $streamingIp) {
+        Write-Report "  Используется для стриминга (L3)"
+        if ($nicBytesPerSec -gt 900) { Write-Report "  ВНИМАНИЕ: Высокая нагрузка на стриминг - узкое место" }
+    } else {
+        Write-Report "  Используется для vDisk Store или другого трафика"
+        if ($nicBytesPerSec -gt 900) { Write-Report "  ВНИМАНИЕ: Высокая нагрузка на NIC - возможное узкое место" }
     }
+    
+    $mtu = (Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.Description -eq $nic.Description }).MTU
+    if ($mtu -and $mtu -ne $RecommendedMtu) {
+        Write-Report "  ВНИМАНИЕ: MTU = $mtu (рекомендуется $RecommendedMtu) - потенциальное узкое место"
+    }
+}
 
-    try {
-        # Мониторинг CPU
-        $cpuUsage = (Get-Counter "\Processor(_Total)\% Processor Time" -ErrorAction Stop).CounterSamples.CookedValue
+# 3. Мониторинг стриминга
+Write-Report "`n=== Стриминг ==="
+if ($pvsServer) {
+    $udpPorts = $pvsServer.FirstPort..$pvsServer.LastPort
+    $activeConnections = Get-NetUDPEndpoint -LocalPort $udpPorts -ErrorAction SilentlyContinue
+    $deviceCount = $activeConnections.Count
+    Write-Report "Подключённых устройств: $deviceCount"
+    if ($deviceCount -gt $RecommendedMaxDevicesBooting) {
+        Write-Report "ВНИМАНИЕ: Превышено рекомендуемое количество устройств ($RecommendedMaxDevicesBooting) - узкое место"
+    }
+} else {
+    Write-Report "Не удалось определить порты стриминга"
+}
 
-        # Мониторинг RAM
-        $availableMemory = (Get-Counter "\Memory\Available MBytes" -ErrorAction Stop).CounterSamples.CookedValue
-        $cacheBytes = (Get-Counter "\Memory\Cache Bytes" -ErrorAction Stop).CounterSamples.CookedValue / 1MB
-        $copyReadHits = (Get-Counter "\Cache\Copy Read Hits %" -ErrorAction Stop).CounterSamples.CookedValue
+# 4. Проверка доступа к vDisk Store
+Write-Report "`n=== vDisk Store ==="
+$pvsStore = Get-PvsStore -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($pvsStore) {
+    $storePath = $pvsStore.Path
+    if (Test-Path -Path $storePath) {
+        $startTime = Get-Date
+        $testFile = Join-Path $storePath "testfile_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+        "Тест" | Out-File $testFile -Force
+        $endTime = Get-Date
+        $latency = [math]::Round(($endTime - $startTime).TotalMilliseconds, 2)
+        Remove-Item $testFile -Force
+        Write-Report "Доступ к $storePath: Успешно | Задержка: $latency мс"
+        if ($latency -gt 50) { Write-Report "ВНИМАНИЕ: Высокая задержка доступа к хранилищу - узкое место" }
+    } else {
+        Write-Report "ОШИБКА: Нет доступа к $storePath - критическое узкое место"
+    }
+} else {
+    Write-Report "Не удалось определить vDisk Store"
+}
 
-        # Мониторинг потоков (предполагается сервер PVS, мониторим StreamService)
-        $threadCount = (Get-Process -Name "StreamService" -ErrorAction SilentlyContinue).Threads.Count
-        if (!$threadCount) { $threadCount = 0 }
-
-        # Мониторинг I/O к диску (локальный диск)
-        $diskReads = (Get-Counter "\PhysicalDisk(_Total)\Disk Reads/sec" -ErrorAction Stop).CounterSamples.CookedValue
-        $diskQueue = (Get-Counter "\PhysicalDisk(_Total)\Avg. Disk Queue Length" -ErrorAction Stop).CounterSamples.CookedValue
-
-        # Мониторинг сети (для CIFS, косвенно)
-        $networkBytesReceived = 0
-        $networkBytesSent = 0
-        if ($networkAdapter) {
-            try {
-                $networkBytesReceived = [math]::Round((Get-Counter "\Network Interface($($networkAdapter.Name))\Bytes Received/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8, 2)  # Мбит/с
-                $networkBytesSent = [math]::Round((Get-Counter "\Network Interface($($networkAdapter.Name))\Bytes Sent/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8, 2)  # Мбит/с
-            }
-            catch {
-                Write-Host "Предупреждение: Ошибка при мониторинге сети. Используются значения по умолчанию (0 Мбит/с)." -ForegroundColor Yellow
-            }
+# 5. Проверка настроек PVS
+Write-Report "`n=== Настройки PVS ==="
+$pvsService = Get-Service -Name "StreamService" -ErrorAction SilentlyContinue
+if ($pvsService -and $pvsService.Status -eq "Running") {
+    Write-Report "Служба PVS: Работает"
+    
+    if ($pvsServer) {
+        $threadsPerPort = $pvsServer.ThreadsPerPort
+        $bootPause = $pvsServer.BootPauseSeconds
+        $maxDevices = $pvsServer.MaximumDevicesBooting
+        
+        Write-Report "Threads per port: $threadsPerPort (рекомендуется $RecommendedThreadsPerPort)"
+        if ($threadsPerPort -lt $RecommendedThreadsPerPort) { 
+            Write-Report "ВНИМАНИЕ: Низкое значение - потенциальное узкое место при стриминге" 
         }
-
-        # Анализ
-        $analysis = @()
-        if ($cpuUsage -gt $cpuThreshold) { $analysis += "Высокая загрузка CPU ($cpuUsage%)" }
-        if ($availableMemory -lt $memoryThreshold) { $analysis += "Нехватка памяти ($availableMemory МБ)" }
-        if ($copyReadHits -lt $cacheHitsThreshold) { $analysis += "Низкие кэш-хиты ($copyReadHits%)" }
-        if ($diskQueue -gt $diskQueueThreshold) { $analysis += "Высокая очередь I/O локального диска ($diskQueue)" }
-        if ($networkBytesReceived -lt $networkThreshold -or $networkBytesSent -lt $networkThreshold) { 
-            $analysis += "Низкий сетевой трафик ($networkBytesReceived/$networkBytesSent Мбит/с) — возможно, проблемы с CIFS." 
+        
+        Write-Report "Boot pause seconds: $bootPause (рекомендуется $RecommendedBootPauseSeconds)"
+        if ($bootPause -lt $RecommendedBootPauseSeconds) { 
+            Write-Report "ВНИМАНИЕ: Низкое значение - риск перегрузки при boot storm" 
         }
-
-        if ($analysis.Count -eq 0) { $analysis += "Производительность в норме." }
-        $analysisText = $analysis -join "; "
-
-        # Обновление метрик
-        $metrics.CPU_Usage_Percent = [math]::Round($cpuUsage, 2)
-        $metrics.Available_Memory_MB = [math]::Round($availableMemory, 2)
-        $metrics.Cache_Bytes_MB = [math]::Round($cacheBytes, 2)
-        $metrics.Copy_Read_Hits_Percent = [math]::Round($copyReadHits, 2)
-        $metrics.Thread_Count = $threadCount
-        $metrics.Disk_Reads_sec = [math]::Round($diskReads, 2)
-        $metrics.Disk_Queue_Length = [math]::Round($diskQueue, 2)
-        $metrics.Network_Bytes_Received_Mbps = $networkBytesReceived
-        $metrics.Network_Bytes_Sent_Mbps = $networkBytesSent
-        $metrics.Analysis = $analysisText
-
-        # Вывод в консоль
-        Write-Host "Метка времени: $timestamp"
-        Write-Host "CPU: $($metrics.CPU_Usage_Percent)%"
-        Write-Host "Память: $($metrics.Available_Memory_MB) МБ доступно"
-        Write-Host "Кэш: $($metrics.Cache_Bytes_MB) МБ"
-        Write-Host "Кэш-хиты: $($metrics.Copy_Read_Hits_Percent)%"
-        Write-Host "Потоки: $($metrics.Thread_Count)"
-        Write-Host "Чтения с диска/с: $($metrics.Disk_Reads_sec), Очередь: $($metrics.Disk_Queue_Length)"
-        Write-Host "Сеть (CIFS): Приём: $($metrics.Network_Bytes_Received_Mbps) Мбит/с, Передача: $($metrics.Network_Bytes_Sent_Mbps) Мбит/с"
-        Write-Host "Ядра: $($metrics.Server_Cores), RAM: $($metrics.Server_RAM_GB) ГБ"
-        Write-Host "Анализ: $analysisText"
-        Write-Host "---"
-
-        # Логирование
-        $metrics | Export-Csv -Path $LogFile -Append -NoTypeInformation -Encoding UTF8
-        "[$timestamp] $analysisText" | Out-File $TextLogFile -Append -Encoding UTF8
+        
+        Write-Report "Max devices booting: $maxDevices (рекомендуется $RecommendedMaxDevicesBooting)"
+        if ($maxDevices -gt $RecommendedMaxDevicesBooting) { 
+            Write-Report "ВНИМАНИЕ: Высокое значение - узкое место при массовой загрузке" 
+        }
+    } else {
+        Write-Report "ОШИБКА: Не удалось получить данные о сервере"
     }
-    catch {
-        Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red
-        "[$timestamp] Ошибка: $($_.Exception.Message)" | Out-File $TextLogFile -Append -Encoding UTF8
-    }
+} else {
+    Write-Report "ОШИБКА: Служба PVS не запущена - критическое узкое место"
 }
 
-# Запуск мониторинга
-$runTimeSeconds = $RunTimeMinutes * 60
-$startTime = Get-Date
-
-Write-Host "Запуск мониторинга сервера на $RunTimeMinutes минут..." -ForegroundColor Green
-
-while (((Get-Date) - $startTime).TotalSeconds -lt $runTimeSeconds) {
-    Get-ServerPerformanceMetrics
-    Start-Sleep -Seconds $SampleInterval
-}
-
-Write-Host "Мониторинг завершён. Логи сохранены в $LogFile и $TextLogFile" -ForegroundColor Green
-
-# Очистка старых логов
-Get-ChildItem -Path $LogPath -Filter "Server_Performance_Log_*" -Recurse | 
-Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | 
-Remove-Item -Force
-Write-Host "Удалены старые логи старше 7 дней." -ForegroundColor Green
+# Сохранение отчёта
+$Report | Out-File $OutputFile -Encoding UTF8
+Write-Report "`nОтчёт сохранён в $OutputFile"
