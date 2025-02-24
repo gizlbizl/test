@@ -104,30 +104,6 @@ foreach ($nic in $nics) {
     }
 }
 
-# 3. Мониторинг стриминга
-Write-Report "`n=== Стриминг ==="
-if ($pvsServer) {
-    try {
-        $udpPorts = $pvsServer.FirstPort..$pvsServer.LastPort
-        $deviceCount = 0
-        foreach ($port in $udpPorts) {
-            # Проверяем доступность порта с помощью Test-NetConnection (если PowerShell 4.0+)
-            $connection = Test-NetConnection -Port $port -ErrorAction SilentlyContinue
-            if ($connection.TcpTestSucceeded) {
-                $connections = Get-NetUDPEndpoint -LocalPort $port -ErrorAction SilentlyContinue
-                if ($connections) { $deviceCount += $connections.Count }
-            }
-        }
-        Write-Report "Порты стриминга: $($pvsServer.FirstPort)-$($pvsServer.LastPort)"
-        Write-Report "Подключённых устройств: $deviceCount"
-        if ($deviceCount -gt 250) { Write-Report "ВНИМАНИЕ: Высокое количество устройств - потенциальное узкое место" }
-    } catch {
-        Write-Report "ОШИБКА: Не удалось проверить стриминг - $($_.Exception.Message)"
-    }
-} else {
-    Write-Report "ОШИБКА: Не удалось определить порты стриминга - данные сервера недоступны"
-}
-
 # 4. Проверка доступа к vDisk Store текущего сервера
 Write-Report "`n=== vDisk Store текущего сервера ==="
 if ($pvsServer) {
