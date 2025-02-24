@@ -1,10 +1,16 @@
 # Скрипт для анализа текущей конфигурации и узких мест Citrix PVS 1912
-# Учитывает только Store текущего сервера, игнорируя другие сайты
+# Учитывает только Store текущего сервера, с обработкой ошибок
 # Запуск на текущем сервере PVS с правами администратора
-# Требуется модуль Citrix PVS SnapIn
 
-# Импорт модуля PVS
-Add-PSSnapin Citrix.PVS.SnapIn -ErrorAction SilentlyContinue
+# Проверка и импорт модуля PVS
+if (-not (Get-PSSnapin -Name "Citrix.PVS.SnapIn" -ErrorAction SilentlyContinue)) {
+    try {
+        Add-PSSnapin Citrix.PVS.SnapIn -ErrorAction Stop
+    } catch {
+        Write-Host "ОШИБКА: Не удалось загрузить модуль Citrix PVS SnapIn. Запустите с правами администратора или установите модуль."
+        exit 1
+    }
+}
 
 # Инициализация отчёта
 $Report = @("Анализ текущей конфигурации и узких мест Citrix PVS 1912 - $(Get-Date)", "Запущен на сервере: $env:COMPUTERNAME")
@@ -19,16 +25,20 @@ function Write-Report {
 
 # 1. Проверка состояния текущего сервера
 Write-Report "`n=== Состояние сервера ==="
-$cpu = Get-Counter -Counter "\Processor(_Total)\% Processor Time" -SampleInterval 2 -MaxSamples 3 | 
-       Measure-Object -Property CookedValue -Average | Select-Object -ExpandProperty Average
-$memory = Get-CimInstance Win32_OperatingSystem
-$memoryUsed = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1024 / 1024, 2)
-$memoryTotal = [math]::Round($memory.TotalVisibleMemorySize / 1024 / 1024, 2)
-
-Write-Report "CPU: $cpu% | Память: $memoryUsed GB / $memoryTotal GB"
-if ($cpu -gt 80) { Write-Report "ВНИМАНИЕ: Высокая нагрузка CPU - узкое место" }
-if ($memoryUsed / $memoryTotal -gt 0.9) { Write-Report "ВНИМАНИЕ: Критическая нехватка памяти - узкое место" }
-elseif ($memoryUsed / $memoryTotal -gt 0.7) { Write-Report "ПРЕДУПРЕЖДЕНИЕ: Высокое использование памяти" }
+try {
+    $cpu = Get-Counter -Counter "\Processor(_Total)\% Processor Time" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop | 
+           Measure-Object -Property CookedValue -Average | Select-Object -ExpandProperty Average
+    $memory = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    $memoryUsed = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1MB, 2)
+    $memoryTotal = [math]::Round($memory.TotalVisibleMemorySize / 1MB, 2)
+    
+    Write-Report "CPU: $cpu% | Память: $memoryUsed GB / $memoryTotal GB"
+    if ($cpu -gt 80) { Write-Report "ВНИМАНИЕ: Высокая нагрузка CPU - узкое место" }
+    if ($memoryUsed / $memoryTotal -gt 0.9) { Write-Report "ВНИМАНИЕ: Критическая нехватка памяти - узкое место" }
+    elseif ($memoryUsed / $memoryTotal -gt 0.7) { Write-Report "ПРЕДУПРЕЖДЕНИЕ: Высокое использование памяти" }
+} catch {
+    Write-Report "ОШИБКА: Не удалось собрать данные о состоянии сервера - $($_.Exception.Message)"
+}
 
 # 2. Анализ сетевых интерфейсов
 Write-Report "`n=== Сетевые интерфейсы ==="
@@ -37,68 +47,84 @@ $streamingIp = if ($pvsServer) { $pvsServer.Ip } else { "Не определён
 $nics = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true }
 
 foreach ($nic in $nics) {
-    $nicIp = $nic.IPAddress[0]
-    $nicStats = Get-Counter -Counter "\Network Interface($($nic.Description))\Bytes Total/sec" -SampleInterval 2 -MaxSamples 3
-    $nicBytesPerSec = [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1024 / 1024, 2)
-    $nicErrors = Get-Counter -Counter "\Network Interface($($nic.Description))\Packets Received Errors" -SampleInterval 2 -MaxSamples 3 | 
-                 Measure-Object -Property CookedValue -Average | Select-Object -ExpandProperty Average
-    
-    Write-Report "NIC: $($nic.Description) | IP: $nicIp | Трафик: $nicBytesPerSec MB/s | Ошибки: $nicErrors/с"
-    if ($nicIp -eq $streamingIp) {
-        Write-Report "  Используется для стриминга (L3)"
-        if ($nicBytesPerSec -gt 900) { Write-Report "  ВНИМАНИЕ: Высокая нагрузка на стриминг - узкое место" }
-    } else {
-        Write-Report "  Используется для vDisk Store или другого трафика"
-        if ($nicBytesPerSec -gt 900) { Write-Report "  ВНИМАНИЕ: Высокая нагрузка на NIC - узкое место" }
+    try {
+        $nicIp = $nic.IPAddress[0] -join ", " # Обработка возможного массива IP-адресов
+        $nicStats = Get-Counter -Counter "\Network Interface($($nic.Description))\Bytes Total/sec" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+        $nicBytesPerSec = [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1MB, 2)
+        $nicErrors = Get-Counter -Counter "\Network Interface($($nic.Description))\Packets Received Errors" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop | 
+                     Measure-Object -Property CookedValue -Average | Select-Object -ExpandProperty Average
+        
+        Write-Report "NIC: $($nic.Description) | IP: $nicIp | Трафик: $nicBytesPerSec MB/s | Ошибки: $nicErrors/с"
+        if ($nicIp -like "*$streamingIp*") { # Учитывает, что IP может быть в формате массива
+            Write-Report "  Используется для стриминга (L3)"
+            if ($nicBytesPerSec -gt 900) { Write-Report "  ВНИМАНИЕ: Высокая нагрузка на стриминг - узкое место" }
+        } else {
+            Write-Report "  Используется для vDisk Store или другого трафика"
+            if ($nicBytesPerSec -gt 900) { Write-Report "  ВНИМАНИЕ: Высокая нагрузка на NIC - узкое место" }
+        }
+        if ($nicErrors -gt 0) { Write-Report "  ВНИМАНИЕ: Обнаружены ошибки сети - потенциальное узкое место" }
+        
+        $mtu = (Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.Description -eq $nic.Description }).MTU
+        if ($mtu) { Write-Report "  MTU: $mtu" }
+    } catch {
+        Write-Report "ОШИБКА: Не удалось собрать данные для NIC $($nic.Description) - $($_.Exception.Message)"
     }
-    if ($nicErrors -gt 0) { Write-Report "  ВНИМАНИЕ: Обнаружены ошибки сети - потенциальное узкое место" }
-    
-    $mtu = (Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.Description -eq $nic.Description }).MTU
-    if ($mtu) { Write-Report "  MTU: $mtu" }
 }
 
 # 3. Мониторинг стриминга
 Write-Report "`n=== Стриминг ==="
 if ($pvsServer) {
-    $udpPorts = $pvsServer.FirstPort..$pvsServer.LastPort
-    $activeConnections = Get-NetUDPEndpoint -LocalPort $udpPorts -ErrorAction SilentlyContinue
-    $deviceCount = $activeConnections.Count
-    Write-Report "Порты стриминга: $($pvsServer.FirstPort)-$($pvsServer.LastPort)"
-    Write-Report "Подключённых устройств: $deviceCount"
-    if ($deviceCount -gt 250) { Write-Report "ВНИМАНИЕ: Высокое количество устройств - потенциальное узкое место" }
+    try {
+        $udpPorts = $pvsServer.FirstPort..$pvsServer.LastPort
+        $activeConnections = Get-NetUDPEndpoint -LocalPort $udpPorts -ErrorAction Stop
+        $deviceCount = $activeConnections.Count
+        Write-Report "Порты стриминга: $($pvsServer.FirstPort)-$($pvsServer.LastPort)"
+        Write-Report "Подключённых устройств: $deviceCount"
+        if ($deviceCount -gt 250) { Write-Report "ВНИМАНИЕ: Высокое количество устройств - потенциальное узкое место" }
+    } catch {
+        Write-Report "ОШИБКА: Не удалось проверить стриминг - $($_.Exception.Message)"
+    }
 } else {
-    Write-Report "Не удалось определить порты стриминга"
+    Write-Report "ОШИБКА: Не удалось определить порты стриминга - данные сервера недоступны"
 }
 
 # 4. Проверка доступа к vDisk Store текущего сервера
 Write-Report "`n=== vDisk Store текущего сервера ==="
 if ($pvsServer) {
-    # Получаем сайт текущего сервера
-    $siteId = $pvsServer.SiteId
-    
-    # Находим Store, связанный с текущим сервером через коллекции или прямое использование
-    $pvsStore = Get-PvsStore | Where-Object { 
-        (Get-PvsServerStore -StoreId $_.StoreId -ErrorAction SilentlyContinue).ServerName -contains $env:COMPUTERNAME 
-    } | Select-Object -First 1
-    
-    if ($pvsStore) {
-        $storePath = $pvsStore.Path
-        Write-Report "Путь к vDisk Store: $storePath"
-        if (Test-Path -Path $storePath) {
-            $startTime = Get-Date
-            $testFile = Join-Path $storePath "testfile_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-            "Тест" | Out-File $testFile -Force
-            $endTime = Get-Date
-            $latency = [math]::Round(($endTime - $startTime).TotalMilliseconds, 2)
-            Remove-Item $testFile -Force
-            Write-Report "Доступ: Успешно | Задержка: $latency мс"
-            if ($latency -gt 100) { Write-Report "ВНИМАНИЕ: Высокая задержка доступа к хранилищу - узкое место" }
-            elseif ($latency -gt 50) { Write-Report "ПРЕДУПРЕЖДЕНИЕ: Заметная задержка доступа" }
+    try {
+        # Получаем сайт текущего сервера
+        $siteId = $pvsServer.SiteId
+        
+        # Находим Store, связанный с текущим сервером
+        $pvsStore = Get-PvsStore | Where-Object { 
+            (Get-PvsServerStore -StoreId $_.StoreId -ErrorAction Stop).ServerName -contains $env:COMPUTERNAME 
+        } | Select-Object -First 1
+        
+        if ($pvsStore) {
+            $storePath = $pvsStore.Path
+            Write-Report "Путь к vDisk Store: $storePath"
+            if (Test-Path -Path $storePath -ErrorAction Stop) {
+                try {
+                    $startTime = Get-Date
+                    $testFile = Join-Path $storePath "testfile_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+                    "Тест" | Out-File $testFile -Force -ErrorAction Stop
+                    $endTime = Get-Date
+                    $latency = [math]::Round(($endTime - $startTime).TotalMilliseconds, 2)
+                    Remove-Item $testFile -Force -ErrorAction SilentlyContinue
+                    Write-Report "Доступ: Успешно | Задержка: $latency мс"
+                    if ($latency -gt 100) { Write-Report "ВНИМАНИЕ: Высокая задержка доступа к хранилищу - узкое место" }
+                    elseif ($latency -gt 50) { Write-Report "ПРЕДУПРЕЖДЕНИЕ: Заметная задержка доступа" }
+                } catch {
+                    Write-Report "ОШИБКА: Не удалось выполнить тест доступа к $storePath - $($_.Exception.Message)"
+                }
+            } else {
+                Write-Report "ОШИБКА: Нет доступа к $storePath - критическое узкое место"
+            }
         } else {
-            Write-Report "ОШИБКА: Нет доступа к $storePath - критическое узкое место"
+            Write-Report "Не удалось определить vDisk Store текущего сервера"
         }
-    } else {
-        Write-Report "Не удалось определить vDisk Store текущего сервера"
+    } catch {
+        Write-Report "ОШИБКА: Не удалось обработать Store - $($_.Exception.Message)"
     }
 } else {
     Write-Report "Не удалось получить информацию о сервере"
@@ -130,6 +156,18 @@ if ($pvsService -and $pvsService.Status -eq "Running") {
     Write-Report "ОШИБКА: Служба PVS не запущена - критическое узкое место"
 }
 
-# Сохранение отчёта
-$Report | Out-File $OutputFile -Encoding UTF8
-Write-Report "`nОтчёт сохранён в $OutputFile"
+# 6. Сохранение отчёта с проверкой пути
+try {
+    $Report | Out-File $OutputFile -Encoding UTF8 -ErrorAction Stop
+    Write-Report "`nОтчёт сохранён в $OutputFile"
+} catch {
+    Write-Report "ОШИБКА: Не удалось сохранить отчёт в $OutputFile - $($_.Exception.Message)"
+    # Попробуем сохранить в другую локацию
+    $altOutputFile = ".\PVS_Analysis_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+    try {
+        $Report | Out-File $altOutputFile -Encoding UTF8 -ErrorAction Stop
+        Write-Report "Отчёт сохранён в $altOutputFile как резервный вариант"
+    } catch {
+        Write-Report "ОШИБКА: Не удалось сохранить отчёт в резервной локации - $($_.Exception.Message)"
+    }
+}
