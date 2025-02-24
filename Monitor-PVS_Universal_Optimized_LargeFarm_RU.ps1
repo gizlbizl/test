@@ -1,12 +1,13 @@
 <#
 .SYNOPSIS
-Оптимизированный универсальный скрипт для мониторинга и анализа производительности серверов Citrix Provisioning Services (PVS) с проверкой Event Viewer, логированием и PVS командлетами для больших ферм.
+Оптимизированный универсальный скрипт для мониторинга и анализа производительности серверов Citrix Provisioning Services (PVS) с проверкой Event Viewer, логированием и PVS командлетами для больших ферм с улучшенной обработкой ошибок.
 
 .DESCRIPTION
 Данный скрипт автоматически определяет конфигурацию любого PVS-сервера (количество ядер, RAM, сетевые интерфейсы, количество Target Devices, версию PVS),
 собирает оптимизированные метрики производительности (CPU, RAM, кэш, сеть, потоки, I/O),
-использует оптимизированные PVS-командлеты для больших ферм, минимизируя нагрузку с помощью кэширования, фильтрации и асинхронных вызовов,
-динамически адаптирует пороги, интервалы и метрики под среду, проверяет логи Event Viewer на ошибки PVS и записывает результаты в лог-файлы (CSV и текстовый),
+использует оптимизированные PVS-командлеты для больших ферм с кэшированием и фильтрацией,
+динамически адаптирует пороги, интервалы и метрики под среду, проверяет логи Event Viewer на ошибки PVS,
+записывает результаты в лог-файлы (CSV и текстовый) с детальным логированием ошибок,
 выводя данные в консоль на русском языке. Подходит для любых версий PVS с разделением сетей L3 (Target Devices) и L2 (NetApp CIFS) в больших фермах.
 
 .ПАРАМЕТРЫ
@@ -15,7 +16,7 @@
 -CacheDurationMinutes: Время кэширования данных PVS в минутах (по умолчанию: 5, для больших ферм).
 
 .ПРИМЕРЫ
-.\Monitor-PVS_Universal_Optimized_LargeFarm_RU.ps1 -LogPath "D:\PVS_Logs" -RunTimeMinutes 45 -CacheDurationMinutes 10
+.\Monitor-PVS_Universal_Optimized_LargeFarm_ErrorHandling_RU.ps1 -LogPath "D:\PVS_Logs" -RunTimeMinutes 45 -CacheDurationMinutes 10
 Запустит оптимизированный мониторинг для больших ферм с логами в D:\PVS_Logs, длительностью 45 минут и кэшированием данных на 10 минут.
 
 .ЗАМЕЧАНИЯ
@@ -24,7 +25,7 @@
 - Скрипт автоматически определяет все параметры среды и адаптирует пороги и интервалы для больших ферм.
 - Скрипт проверяет журналы "Application" и "System" на события от Citrix PVS (идентификаторы событий 1000-1999 или источник "Citrix PVS").
 - Логи очищаются автоматически для файлов старше 7 дней.
-- Для больших ферм рекомендуется увеличить CacheDurationMinutes для снижения нагрузки.
+- Для больших ферм рекомендуется увеличить CacheDurationMinutes (до 10–30 минут) и SampleInterval (до 20–30 секунд).
 
 #>
 
@@ -35,18 +36,32 @@ Param (
     [int]$CacheDurationMinutes = 5     # Время кэширования данных PVS в минутах
 )
 
+# Функция для логирования ошибок в текстовый файл
+function Write-ErrorLog {
+    param ([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "[$timestamp] Ошибка: $Message" | Out-File -FilePath $TextLogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
 # Автоматическое определение пути для логов с учётом места на диске
-$drives = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3" | Where-Object { $_.FreeSpace -gt 10GB }
-if ($drives) {
-    $bestDrive = $drives | Sort-Object -Property FreeSpace -Descending | Select-Object -First 1
-    $LogPath = Join-Path $bestDrive.DeviceID "PVS_Logs"
-    if (-not (Test-Path $LogPath)) {
-        New-Item -ItemType Directory -Path $LogPath | Out-Null
-        Write-Host "Автоматически выбран путь для логов: $LogPath (доступно места: $($bestDrive.FreeSpace/1GB) ГБ)" -ForegroundColor Green
+try {
+    $drives = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop | Where-Object { $_.FreeSpace -gt 10GB }
+    if ($drives) {
+        $bestDrive = $drives | Sort-Object -Property FreeSpace -Descending | Select-Object -First 1
+        $LogPath = Join-Path $bestDrive.DeviceID "PVS_Logs"
+        if (-not (Test-Path $LogPath)) {
+            New-Item -ItemType Directory -Path $LogPath -ErrorAction Stop | Out-Null
+            Write-Host "Автоматически выбран путь для логов: $LogPath (доступно места: $($bestDrive.FreeSpace/1GB) ГБ)" -ForegroundColor Green
+        }
+    }
+    else {
+        Write-Host "Предупреждение: Недостаточно места на дисках для логов. Используется $LogPath." -ForegroundColor Yellow
     }
 }
-else {
-    Write-Host "Предупреждение: Недостаточно места на дисках для логов. Используется $LogPath." -ForegroundColor Yellow
+catch {
+    Write-Host "Ошибка при определении пути для логов: $($_.Exception.Message)" -ForegroundColor Red
+    Write-ErrorLog "Ошибка при определении пути для логов: $($_.Exception.Message)"
+    $LogPath = "C:\PVS_Logs"  # Резервный путь
 }
 
 # Автоматическое создание имени файла
@@ -54,8 +69,14 @@ $LogFile = Join-Path $LogPath "PVS_Performance_Log_$(Get-Date -Format 'yyyyMMdd_
 $TextLogFile = "$LogFile.txt"
 
 # Создание CSV-файла с заголовками
-"Timestamp,CPU_Usage_%,Processor_Queue,Available_Memory_MB,Cache_Bytes_MB,Copy_Read_Hits_%,L2_Bytes_Received_Mbps,L2_Bytes_Sent_Mbps,L3_Bytes_Received_Mbps,L3_Bytes_Sent_Mbps,Thread_Count,Disk_Reads_sec,Disk_Queue_Length,PVS_Server_Status,PVS_Threads,PVS_Cache_Usage,PVS_Device_Count,Server_Cores,Server_RAM_GB,Server_Network_Speed_Gbps,PVS_Version,Analysis" | 
-Out-File $LogFile -Encoding UTF8
+try {
+    "Timestamp,CPU_Usage_%,Processor_Queue,Available_Memory_MB,Cache_Bytes_MB,Copy_Read_Hits_%,L2_Bytes_Received_Mbps,L2_Bytes_Sent_Mbps,L3_Bytes_Received_Mbps,L3_Bytes_Sent_Mbps,Thread_Count,Disk_Reads_sec,Disk_Queue_Length,PVS_Server_Status,PVS_Threads,PVS_Cache_Usage,PVS_Device_Count,Server_Cores,Server_RAM_GB,Server_Network_Speed_Gbps,PVS_Version,Analysis" | 
+    Out-File $LogFile -Encoding UTF8
+}
+catch {
+    Write-Host "Ошибка при создании CSV-файла логов: $($_.Exception.Message)" -ForegroundColor Red
+    Write-ErrorLog "Ошибка при создании CSV-файла логов: $($_.Exception.Message)"
+}
 
 # Регистрация PVS Snap-In (если не зарегистрирован)
 try {
@@ -66,6 +87,7 @@ try {
 }
 catch {
     Write-Host "Ошибка при регистрации PVS Snap-In: $($_.Exception.Message)" -ForegroundColor Red
+    Write-ErrorLog "Ошибка при регистрации PVS Snap-In: $($_.Exception.Message)"
     exit
 }
 
@@ -80,61 +102,110 @@ function Get-PVSCachedData {
         return $pvsCache
     }
     else {
-        $pvsServer = Get-PVSServer -Name $env:COMPUTERNAME -ErrorAction Stop
-        $pvsDevices = (Get-PVSTargetDevice -Server $pvsServer -ErrorAction Stop | Where-Object { $_.Status -eq "Active" } | Measure-Object).Count  # Фильтрация активных устройств
-        $pvsData = [PSCustomObject]@{
-            Server = $pvsServer
-            DeviceCount = $pvsDevices
-            Threads = $pvsServer.ThreadCount
-            CacheUsage = $pvsServer.CacheSizeMB
-            Status = $pvsServer.Status
-            Version = $pvsServer.Version
+        try {
+            $pvsServer = Get-PVSServer -Name $env:COMPUTERNAME -ErrorAction Stop
+            $pvsDevices = (Get-PVSTargetDevice -Server $pvsServer -ErrorAction Stop | Where-Object { $_.Status -eq "Active" } | Measure-Object).Count  # Фильтрация активных устройств
+            $pvsData = [PSCustomObject]@{
+                Server = $pvsServer
+                DeviceCount = $pvsDevices
+                Threads = $pvsServer.ThreadCount
+                CacheUsage = $pvsServer.CacheSizeMB
+                Status = $pvsServer.Status
+                Version = $pvsServer.Version
+            }
+            $global:pvsCache = $pvsData
+            $global:pvsCacheTimestamp = $currentTime
+            return $pvsData
         }
-        $global:pvsCache = $pvsData
-        $global:pvsCacheTimestamp = $currentTime
-        return $pvsData
+        catch {
+            Write-Host "Ошибка при кэшировании данных PVS: $($_.Exception.Message)" -ForegroundColor Red
+            Write-ErrorLog "Ошибка при кэшировании данных PVS: $($_.Exception.Message)"
+            return $null
+        }
     }
 }
 
 # Автоматическое определение конфигурации сервера
-$serverCores = (Get-WmiObject -Class Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum  # Количество ядер
-$serverRAM = [math]::Round((Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum / 1GB, 2)  # RAM в ГБ
+try {
+    $serverCores = (Get-WmiObject -Class Win32_Processor | Measure-Object -Property NumberOfCores -Sum -ErrorAction Stop).Sum  # Количество ядер
+    $serverRAM = [math]::Round((Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum -ErrorAction Stop).Sum / 1GB, 2)  # RAM в ГБ
+}
+catch {
+    Write-Host "Ошибка при определении конфигурации сервера: $($_.Exception.Message)" -ForegroundColor Red
+    Write-ErrorLog "Ошибка при определении конфигурации сервера: $($_.Exception.Message)"
+    $serverCores = 1  # Значение по умолчанию
+    $serverRAM = 4  # Значение по умолчанию
+}
 
 # Определение скорости сети (L3 и L2), универсально
-$networkAdapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 2
-$L3Adapter = $networkAdapters | Select-Object -First 1  # L3 (Target Devices)
-$L2Adapter = $networkAdapters | Select-Object -Skip 1 -First 1  # L2 (NetApp CIFS)
-if (!$L3Adapter -or !$L2Adapter) {
-    Write-Host "Ошибка: Не удалось найти сетевые интерфейсы. Проверьте их через Get-NetAdapter." -ForegroundColor Red
-    exit
+try {
+    $networkAdapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 2
+    $L3Adapter = $networkAdapters | Select-Object -First 1  # L3 (Target Devices)
+    $L2Adapter = $networkAdapters | Select-Object -Skip 1 -First 1  # L2 (NetApp CIFS)
+    if (!$L3Adapter -or !$L2Adapter) {
+        throw "Не удалось найти сетевые интерфейсы"
+    }
+    $serverNetworkSpeed = ($L3Adapter.LinkSpeed -replace " Gbps", "")  # Скорость сети, адаптируется
+    if (!$serverNetworkSpeed) { $serverNetworkSpeed = 1 }  # Значение по умолчанию, если не определено
+    Write-Host "L3 (Устройства Target): $($L3Adapter.Name), Скорость: $serverNetworkSpeed Гбит/с" -ForegroundColor Green
+    Write-Host "L2 (NetApp CIFS): $($L2Adapter.Name), Скорость: $serverNetworkSpeed Гбит/с" -ForegroundColor Green
 }
-$serverNetworkSpeed = ($L3Adapter.LinkSpeed -replace " Gbps", "")  # Скорость сети, адаптируется
-if (!$serverNetworkSpeed) { $serverNetworkSpeed = 1 }  # Значение по умолчанию, если не определено
-Write-Host "L3 (Устройства Target): $($L3Adapter.Name), Скорость: $serverNetworkSpeed Гбит/с" -ForegroundColor Green
-Write-Host "L2 (NetApp CIFS): $($L2Adapter.Name), Скорость: $serverNetworkSpeed Гбит/с" -ForegroundColor Green
+catch {
+    Write-Host "Ошибка при определении сетевых интерфейсов: $($_.Exception.Message)" -ForegroundColor Red
+    Write-ErrorLog "Ошибка при определении сетевых интерфейсов: $($_.Exception.Message)"
+    $L3Adapter = $null
+    $L2Adapter = $null
+    $serverNetworkSpeed = 1  # Значение по умолчанию
+}
 
 # Динамические параметры, адаптированные под любую среду для больших ферм
-$sampleInterval = [math]::Max(5, [math]::Min(30, [math]::Round($serverCores / 2, 0)))  # Интервал от 5 до 30 секунд, адаптирован под количество ядер для больших ферм
-$runTimeMinutes = [math]::Max(15, [math]::Min(240, [math]::Round($pvsDevices / 5, 0)))  # Время работы от 15 до 240 минут, адаптировано под количество устройств
-$cpuThreshold = [math]::Min(70, 100 - ($serverCores * 5))  # Порог CPU, сниженный для текущих ядер (макс. 70%)
-$queueThreshold = [math]::Min(10, $serverCores)  # Порог очереди задач, равный количеству ядер или меньше
-$memoryThreshold = [math]::Max(2000, $serverRAM * 1024 * 0.1)  # 10% от RAM в МБ (мин. 2000 МБ)
-$cacheHitsThreshold = 80 + ($pvsDevices / 1000)  # Адаптировано под количество устройств (макс. 90% для больших сред)
-$networkThreshold = [math]::Max(200, $serverNetworkSpeed * 400)  # Адаптировано под скорость сети (мин. 200 Мбит/с)
-$diskQueueThreshold = 1  # Низкий порог для стабильности
+try {
+    $sampleInterval = [math]::Max(5, [math]::Min(30, [math]::Round($serverCores / 2, 0)))  # Интервал от 5 до 30 секунд, адаптирован под количество ядер
+    $runTimeMinutes = [math]::Max(15, [math]::Min(240, [math]::Round($pvsDevices / 5, 0)))  # Время работы от 15 до 240 минут, адаптировано под количество устройств
+    $cpuThreshold = [math]::Min(70, 100 - ($serverCores * 5))  # Порог CPU, сниженный для текущих ядер (макс. 70%)
+    $queueThreshold = [math]::Min(10, $serverCores)  # Порог очереди задач, равный количеству ядер или меньше
+    $memoryThreshold = [math]::Max(2000, $serverRAM * 1024 * 0.1)  # 10% от RAM в МБ (мин. 2000 МБ)
+    $pvsData = Get-PVSCachedData -CacheDurationMinutes $CacheDurationMinutes
+    if ($pvsData) {
+        $pvsDevices = $pvsData.DeviceCount
+        $pvsServerStatus = $pvsData.Status
+        $pvsThreads = $pvsData.Threads
+        $pvsCacheUsage = $pvsData.CacheUsage
+        $pvsVersion = $pvsData.Version
+    }
+    else {
+        $pvsDevices = 0
+        $pvsServerStatus = "Неизвестно"
+        $pvsThreads = 0
+        $pvsCacheUsage = 0
+        $pvsVersion = "Неизвестно"
+    }
+    $cacheHitsThreshold = 80 + ($pvsDevices / 1000)  # Адаптировано под количество устройств (макс. 90% для больших сред)
+    $networkThreshold = [math]::Max(200, $serverNetworkSpeed * 400)  # Адаптировано под скорость сети (мин. 200 Мбит/с)
+    $diskQueueThreshold = 1  # Низкий порог для стабильности
 
-# Кэширование данных PVS
-$pvsData = Get-PVSCachedData -CacheDurationMinutes $CacheDurationMinutes
-$pvsDevices = $pvsData.DeviceCount
-$pvsServerStatus = $pvsData.Status
-$pvsThreads = $pvsData.Threads
-$pvsCacheUsage = $pvsData.CacheUsage
-$pvsVersion = $pvsData.Version
+    Write-Host "Автоматически определено: $serverCores ядер, $serverRAM ГБ RAM, $serverNetworkSpeed Гбит/с сети, $pvsDevices устройств PVS, версия PVS: $pvsVersion" -ForegroundColor Green
+    Write-Host "Динамические параметры: Интервал = $sampleInterval сек, Время работы = $runTimeMinutes мин, Пороги: CPU=$cpuThreshold%, Очередь=$queueThreshold, Память=$memoryThreshold МБ, Кэш-хиты=$cacheHitsThreshold%, Сеть=$networkThreshold Мбит/с, Диск=$diskQueueThreshold, Кэш PVS=$CacheDurationMinutes мин" -ForegroundColor Green
+}
+catch {
+    Write-Host "Ошибка при определении динамических параметров: $($_.Exception.Message)" -ForegroundColor Red
+    Write-ErrorLog "Ошибка при определении динамических параметров: $($_.Exception.Message)"
+    $sampleInterval = 10  # Значение по умолчанию
+    $runTimeMinutes = 30  # Значение по умолчанию
+    $cpuThreshold = 70
+    $queueThreshold = 10
+    $memoryThreshold = 2000
+    $cacheHitsThreshold = 80
+    $networkThreshold = 200
+    $diskQueueThreshold = 1
+    $pvsDevices = 0
+    $pvsServerStatus = "Неизвестно"
+    $pvsThreads = 0
+    $pvsCacheUsage = 0
+    $pvsVersion = "Неизвестно"
+}
 
-Write-Host "Автоматически определено: $serverCores ядер, $serverRAM ГБ RAM, $serverNetworkSpeed Гбит/с сети, $pvsDevices устройств PVS, версия PVS: $pvsVersion" -ForegroundColor Green
-Write-Host "Динамические параметры: Интервал = $sampleInterval сек, Время работы = $runTimeMinutes мин, Пороги: CPU=$cpuThreshold%, Очередь=$queueThreshold, Память=$memoryThreshold МБ, Кэш-хиты=$cacheHitsThreshold%, Сеть=$networkThreshold Мбит/с, Диск=$diskQueueThreshold, Кэш PVS=$CacheDurationMinutes мин" -ForegroundColor Green
-
-# Функция для получения и анализа метрик, оптимизирована для больших ферм
+# Функция для получения и анализа метрик, оптимизирована для больших ферм с обработкой ошибок
 function Get-PVSPerformanceMetrics {
     # Получаем текущую метку времени
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -174,10 +245,15 @@ function Get-PVSPerformanceMetrics {
         $cacheHits = (Get-Counter "\Cache\Copy Read Hits %" -ErrorAction Stop).CounterSamples.CookedValue
 
         # Мониторинг сети (L3 и L2), адаптировано под динамическую скорость сети
-        $l3Rx = (Get-Counter "\Network Interface($($L3Adapter.Name))\Bytes Received/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8  # Мбит/с
-        $l3Tx = (Get-Counter "\Network Interface($($L3Adapter.Name))\Bytes Sent/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8  # Мбит/с
-        $l2Rx = (Get-Counter "\Network Interface($($L2Adapter.Name))\Bytes Received/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8  # Мбит/с
-        $l2Tx = (Get-Counter "\Network Interface($($L2Adapter.Name))\Bytes Sent/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8  # Мбит/с
+        if ($L3Adapter -and $L2Adapter) {
+            $l3Rx = (Get-Counter "\Network Interface($($L3Adapter.Name))\Bytes Received/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8  # Мбит/с
+            $l3Tx = (Get-Counter "\Network Interface($($L3Adapter.Name))\Bytes Sent/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8  # Мбит/с
+            $l2Rx = (Get-Counter "\Network Interface($($L2Adapter.Name))\Bytes Received/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8  # Мбит/с
+            $l2Tx = (Get-Counter "\Network Interface($($L2Adapter.Name))\Bytes Sent/sec" -ErrorAction Stop).CounterSamples.CookedValue / 1MB * 8  # Мбит/с
+        }
+        else {
+            $l3Rx = 0; $l3Tx = 0; $l2Rx = 0; $l2Tx = 0
+        }
 
         # Мониторинг потоков PVS
         $threadCount = (Get-Process -Name "StreamService" -ErrorAction SilentlyContinue).Threads.Count
@@ -189,10 +265,20 @@ function Get-PVSPerformanceMetrics {
 
         # Обновление кэша PVS данных для больших ферм
         $pvsData = Get-PVSCachedData -CacheDurationMinutes $CacheDurationMinutes
-        $pvsServerStatus = $pvsData.Status
-        $pvsThreads = $pvsData.Threads
-        $pvsCacheUsage = $pvsData.CacheUsage
-        $pvsDevices = $pvsData.DeviceCount
+        if ($pvsData) {
+            $pvsServerStatus = $pvsData.Status
+            $pvsThreads = $pvsData.Threads
+            $pvsCacheUsage = $pvsData.CacheUsage
+            $pvsDevices = $pvsData.DeviceCount
+            $pvsVersion = $pvsData.Version
+        }
+        else {
+            $pvsServerStatus = "Неизвестно"
+            $pvsThreads = 0
+            $pvsCacheUsage = 0
+            $pvsDevices = 0
+            $pvsVersion = "Неизвестно"
+        }
 
         # Анализ данных, адаптированный под любую среду для больших ферм
         $analysis = @()
@@ -228,18 +314,24 @@ function Get-PVSPerformanceMetrics {
         }
 
         # Проверка логов Event Viewer на ошибки PVS, оптимизировано для больших ферм
-        $eventErrors = @()
-        $pvsEvents = Get-WinEvent -LogName "Application", "System" -ErrorAction SilentlyContinue | 
-                     Where-Object { 
-                         ($_.ProviderName -like "*Citrix PVS*" -or $_.Id -in 1000..1999) -and 
-                         ($_.Level -eq 2 -or $_.Level -eq 3)  # Уровни: Error (2), Warning (3)
-                     } | 
-                     Select-Object -Last 3  # Ещё больше уменьшено для производительности в больших фермах
-        if ($pvsEvents) {
-            foreach ($event in $pvsEvents) {
-                $eventErrors += "Журнал: $($event.LogName), ID: $($event.Id), Время: $($event.TimeCreated), Сообщение: $($event.Message)"
+        try {
+            $eventErrors = @()
+            $pvsEvents = Get-WinEvent -LogName "Application", "System" -ErrorAction Stop | 
+                         Where-Object { 
+                             ($_.ProviderName -like "*Citrix PVS*" -or $_.Id -in 1000..1999) -and 
+                             ($_.Level -eq 2 -or $_.Level -eq 3)  # Уровни: Error (2), Warning (3)
+                         } | 
+                         Select-Object -Last 3  # Ещё больше уменьшено для производительности
+            if ($pvsEvents) {
+                foreach ($event in $pvsEvents) {
+                    $eventErrors += "Журнал: $($event.LogName), ID: $($event.Id), Время: $($event.TimeCreated), Сообщение: $($event.Message)"
+                }
+                $analysis += "Найдены ошибки в Event Viewer для PVS: $($eventErrors -join '; ')"
             }
-            $analysis += "Найдены ошибки в Event Viewer для PVS: $($eventErrors -join '; ')"
+        }
+        catch {
+            $analysis += "Ошибка при доступе к Event Viewer: $($_.Exception.Message)"
+            Write-ErrorLog "Ошибка при доступе к Event Viewer: $($_.Exception.Message)"
         }
 
         # Если нет проблем, добавляем нейтральный комментарий
@@ -292,14 +384,19 @@ function Get-PVSPerformanceMetrics {
         Write-Host "---"
 
         # Запись в лог (CSV и текстовый формат), оптимизировано для производительности
-        $metrics | Export-Csv -Path $LogFile -Append -NoTypeInformation -Encoding UTF8 -ErrorAction SilentlyContinue
-        "[$timestamp] $($metrics.Analysis)" | Out-File -FilePath $TextLogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+        try {
+            $metrics | Export-Csv -Path $LogFile -Append -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+            "[$timestamp] $($metrics.Analysis)" | Out-File -FilePath $TextLogFile -Append -Encoding UTF8 -ErrorAction Stop
+        }
+        catch {
+            Write-Host "Ошибка при записи в лог: $($_.Exception.Message)" -ForegroundColor Red
+            Write-ErrorLog "Ошибка при записи в лог: $($_.Exception.Message)"
+        }
     }
     catch {
         Write-Host "Ошибка при сборе метрик: $($_.Exception.Message)" -ForegroundColor Red
         $metrics.Analysis = "Ошибка: $($_.Exception.Message)"
-        # Запись ошибки в лог
-        "[$timestamp] Ошибка при сборе метрик: $($_.Exception.Message)" | Out-File -FilePath $TextLogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+        Write-ErrorLog "Ошибка при сборе метрик: $($_.Exception.Message)"
     }
 }
 
@@ -319,14 +416,20 @@ try {
 }
 catch {
     Write-Host "Ошибка в основном цикле: $($_.Exception.Message)" -ForegroundColor Red
-    "Ошибка в основном цикле: [$timestamp] $($_.Exception.Message)" | Out-File -FilePath $TextLogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+    Write-ErrorLog "Ошибка в основном цикле: $($_.Exception.Message)"
 }
 finally {
     Write-Host "Мониторинг завершён. Лог сохранён в $LogFile и $TextLogFile" -ForegroundColor Green
 
     # Удаление старых логов (старше 7 дней), оптимизировано для производительности
-    Get-ChildItem -Path $LogPath -Filter "PVS_Performance_Log_*" -Recurse -ErrorAction SilentlyContinue | 
-    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | 
-    Remove-Item -Force -ErrorAction SilentlyContinue
-    Write-Host "Очищены старые логи, созданные более 7 дней назад." -ForegroundColor Green
+    try {
+        Get-ChildItem -Path $LogPath -Filter "PVS_Performance_Log_*" -Recurse -ErrorAction Stop | 
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | 
+        Remove-Item -Force -ErrorAction Stop
+        Write-Host "Очищены старые логи, созданные более 7 дней назад." -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Ошибка при очистке старых логов: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-ErrorLog "Ошибка при очистке старых логов: $($_.Exception.Message)"
+    }
 }
