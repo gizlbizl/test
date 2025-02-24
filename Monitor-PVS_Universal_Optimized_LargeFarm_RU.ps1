@@ -26,8 +26,11 @@ function Write-Report {
 # 1. Проверка состояния текущего сервера
 Write-Report "`n=== Состояние сервера ==="
 try {
-    $cpu = Get-Counter -Counter "\Processor(_Total)\% Processor Time" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop | 
-           Measure-Object -Property CookedValue -Average | Select-Object -ExpandProperty Average
+    $cpuSamples = Get-Counter -Counter "\Processor(_Total)\% Processor Time" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+    $cpu = if ($cpuSamples.CounterSamples -and $cpuSamples.CounterSamples.CookedValue) {
+        [math]::Round(($cpuSamples.CounterSamples.CookedValue | Measure-Object -Average).Average, 2)
+    } else { 0 }
+    
     $memory = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
     $memoryUsed = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1MB, 2)
     $memoryTotal = [math]::Round($memory.TotalVisibleMemorySize / 1MB, 2)
@@ -43,19 +46,26 @@ try {
 # 2. Анализ сетевых интерфейсов
 Write-Report "`n=== Сетевые интерфейсы ==="
 $pvsServer = Get-PvsServer -Name $env:COMPUTERNAME -ErrorAction SilentlyContinue
-$streamingIp = if ($pvsServer) { $pvsServer.Ip } else { "Не определён" }
+$streamingIp = if ($pvsServer -and $pvsServer.Ip) { $pvsServer.Ip } else { "Не определён" }
 $nics = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true }
 
 foreach ($nic in $nics) {
     try {
-        $nicIp = $nic.IPAddress[0] -join ", " # Обработка возможного массива IP-адресов
-        $nicStats = Get-Counter -Counter "\Network Interface($($nic.Description))\Bytes Total/sec" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
-        $nicBytesPerSec = [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1MB, 2)
-        $nicErrors = Get-Counter -Counter "\Network Interface($($nic.Description))\Packets Received Errors" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop | 
-                     Measure-Object -Property CookedValue -Average | Select-Object -ExpandProperty Average
+        $nicIp = $nic.IPAddress -join ", " # Обработка массива IP-адресов
+        $nicDesc = $nic.Description
+        $nicStats = Get-Counter -Counter "\Network Interface($nicDesc)\Bytes Total/sec" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop
+        $nicBytesPerSec = if ($nicStats.CounterSamples -and $nicStats.CounterSamples.CookedValue) {
+            [math]::Round(($nicStats.CounterSamples.CookedValue | Measure-Object -Average).Average / 1MB, 2)
+        } else { 0 }
         
-        Write-Report "NIC: $($nic.Description) | IP: $nicIp | Трафик: $nicBytesPerSec MB/s | Ошибки: $nicErrors/с"
-        if ($nicIp -like "*$streamingIp*") { # Учитывает, что IP может быть в формате массива
+        $nicErrors = if ($nicStats.CounterSamples) {
+            Get-Counter -Counter "\Network Interface($nicDesc)\Packets Received Errors" -SampleInterval 2 -MaxSamples 3 -ErrorAction Stop | 
+            ForEach-Object { if ($_.CounterSamples -and $_.CounterSamples.CookedValue) { [math]::Round($_.CounterSamples.CookedValue, 2) } else { 0 } } | 
+            Measure-Object -Average | Select-Object -ExpandProperty Average
+        } else { 0 }
+        
+        Write-Report "NIC: $nicDesc | IP: $nicIp | Трафик: $nicBytesPerSec MB/s | Ошибки: $nicErrors/с"
+        if ($nicIp -like "*$streamingIp*") {
             Write-Report "  Используется для стриминга (L3)"
             if ($nicBytesPerSec -gt 900) { Write-Report "  ВНИМАНИЕ: Высокая нагрузка на стриминг - узкое место" }
         } else {
@@ -64,10 +74,10 @@ foreach ($nic in $nics) {
         }
         if ($nicErrors -gt 0) { Write-Report "  ВНИМАНИЕ: Обнаружены ошибки сети - потенциальное узкое место" }
         
-        $mtu = (Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.Description -eq $nic.Description }).MTU
+        $mtu = (Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.Description -eq $nicDesc }).MTU
         if ($mtu) { Write-Report "  MTU: $mtu" }
     } catch {
-        Write-Report "ОШИБКА: Не удалось собрать данные для NIC $($nic.Description) - $($_.Exception.Message)"
+        Write-Report "ОШИБКА: Не удалось собрать данные для NIC $nicDesc - $($_.Exception.Message)"
     }
 }
 
@@ -76,8 +86,11 @@ Write-Report "`n=== Стриминг ==="
 if ($pvsServer) {
     try {
         $udpPorts = $pvsServer.FirstPort..$pvsServer.LastPort
-        $activeConnections = Get-NetUDPEndpoint -LocalPort $udpPorts -ErrorAction Stop
-        $deviceCount = $activeConnections.Count
+        $deviceCount = 0
+        foreach ($port in $udpPorts) {
+            $connections = Get-NetUDPEndpoint -LocalPort $port -ErrorAction SilentlyContinue
+            if ($connections) { $deviceCount += $connections.Count }
+        }
         Write-Report "Порты стриминга: $($pvsServer.FirstPort)-$($pvsServer.LastPort)"
         Write-Report "Подключённых устройств: $deviceCount"
         if ($deviceCount -gt 250) { Write-Report "ВНИМАНИЕ: Высокое количество устройств - потенциальное узкое место" }
@@ -97,7 +110,7 @@ if ($pvsServer) {
         
         # Находим Store, связанный с текущим сервером
         $pvsStore = Get-PvsStore | Where-Object { 
-            (Get-PvsServerStore -StoreId $_.StoreId -ErrorAction Stop).ServerName -contains $env:COMPUTERNAME 
+            (Get-PvsServerStore -StoreId $_.StoreId -ServerName $env:COMPUTERNAME -ErrorAction Stop).ServerName -contains $env:COMPUTERNAME 
         } | Select-Object -First 1
         
         if ($pvsStore) {
