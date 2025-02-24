@@ -16,7 +16,7 @@
 -CacheDurationMinutes: Время кэширования данных PVS в минутах (по умолчанию: 5, для больших ферм).
 
 .ПРИМЕРЫ
-.\Monitor-PVS_Universal_Optimized_LargeFarm_ErrorHandling_RU_Final.ps1 -LogPath "D:\PVS_Logs" -RunTimeMinutes 45 -CacheDurationMinutes 10
+.\Monitor-PVS_Universal_Optimized_LargeFarm_ErrorHandling_RU_Final_Fixed.ps1 -LogPath "D:\PVS_Logs" -RunTimeMinutes 45 -CacheDurationMinutes 10
 Запустит оптимизированный мониторинг для больших ферм с логами в D:\PVS_Logs, длительностью 45 минут и кэшированием данных на 10 минут.
 
 .ЗАМЕЧАНИЯ
@@ -104,7 +104,25 @@ function Get-PVSCachedData {
     else {
         try {
             $pvsServer = Get-PVSServer -Name $env:COMPUTERNAME -ErrorAction Stop
-            $pvsDevices = (Get-PVSTargetDevice -Server $pvsServer -ErrorAction Stop | Where-Object { $_.Status -eq "Active" } | Measure-Object).Count  # Фильтрация активных устройств
+            # Проверка наличия командлета Get-PVSTargetDevice
+            if (Get-Command Get-PVSTargetDevice -ErrorAction SilentlyContinue) {
+                $pvsDevices = (Get-PVSTargetDevice -Server $pvsServer -ErrorAction Stop | Where-Object { $_.Status -eq "Active" } | Measure-Object).Count  # Фильтрация активных устройств
+            }
+            else {
+                # Альтернативный метод: использование свойства сервера или подключение к ферме (если доступно)
+                Write-Host "Предупреждение: Командлет Get-PVSTargetDevice не найден. Используется запасной метод подсчёта устройств." -ForegroundColor Yellow
+                Write-ErrorLog "Командлет Get-PVSTargetDevice не найден. Используется запасной метод."
+                $pvsDevices = 0  # Резервное значение, если командлет недоступен
+                # Попробуем получить информацию через другие свойства или подключение
+                try {
+                    $pvsFarm = Get-PVSFarm -ErrorAction Stop
+                    $pvsDevices = ($pvsFarm | Get-PVSSite | Get-PVSServer | Get-PVSTargetDevice -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Active" } | Measure-Object).Count
+                }
+                catch {
+                    Write-Host "Ошибка при альтернативном подсчёте устройств: $($_.Exception.Message)" -ForegroundColor Yellow
+                    Write-ErrorLog "Ошибка при альтернативном подсчёте устройств: $($_.Exception.Message)"
+                }
+            }
             $pvsData = [PSCustomObject]@{
                 Server = $pvsServer
                 DeviceCount = $pvsDevices
