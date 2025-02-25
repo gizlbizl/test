@@ -63,7 +63,8 @@ $errorPatterns = @(
     "missing.*component",
     "corrupt.*file",
     "CSI Payload Corrupt",
-    "CBS MUM Missing"
+    "CBS MUM Missing",
+    "\(p\) CBS Catalog Missing Package"  # Новый шаблон для вашего формата
 )
 
 # Анализ CBS.log
@@ -76,6 +77,11 @@ Get-Content $CBSLogPath @encodingParam | ForEach-Object {
         if ($_ -match $pattern) {
             Write-Log "Найдено совпадение: $_" "Yellow"
             $foundIssues += $_
+            # Извлечение имени пакета для "CBS Catalog Missing Package"
+            if ($_ -match "\(p\) CBS Catalog Missing Package.*for (\S+),") {
+                $missingComponents += $Matches[1]  # Извлекаем KB4503267
+            }
+            # Извлечение для других шаблонов
             if ($_ -match "missing.*component.*(\S+)") {
                 $missingComponents += $Matches[1]
             } elseif ($_ -match "CBS MUM Missing.*(\S+)") {
@@ -84,6 +90,9 @@ Get-Content $CBSLogPath @encodingParam | ForEach-Object {
         }
     }
 }
+
+# Удаление дубликатов компонентов
+$missingComponents = $missingComponents | Sort-Object -Unique
 
 # Функция для генерации имен серверов
 function Get-ServerNames {
