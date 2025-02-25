@@ -74,7 +74,9 @@ $progress = 0
 
 Get-Content $CBSLogPath @encodingParam -ReadCount 1000 | ForEach-Object {
     $progress += 1000
-    Write-Progress -Activity "Анализ CBS.log" -Status "$progress из $lineCount строк" -PercentComplete (($progress / $lineCount) * 100)
+    # Ограничение PercentComplete до 100
+    $percentComplete = [Math]::Min((($progress / $lineCount) * 100), 100)
+    Write-Progress -Activity "Анализ CBS.log" -Status "$progress из $lineCount строк" -PercentComplete $percentComplete
     foreach ($line in $_) {
         foreach ($pattern in $errorPatterns) {
             if ($line -match $pattern) {
@@ -203,6 +205,13 @@ if ($foundIssues.Count -eq 0) {
         exit 1
     }
 
+    # Запрос подтверждения перед запуском DISM
+    $dismConfirm = Read-Host "Запустить DISM для восстановления с источником $sourceServer? (Y/N)"
+    if ($dismConfirm -ne "Y" -and $dismConfirm -ne "y") {
+        Write-Log "DISM не запущен — пользователь отказался." "Yellow"
+        exit 0
+    }
+
     # Запуск DISM
     Write-Log "Все необходимые компоненты найдены. Запуск DISM с источником $sourceServer..." "Cyan"
     $dismCommand = "DISM /Online /Cleanup-Image /RestoreHealth /Source:$sourceServer /LimitAccess /LogPath:$DISMLogPath"
@@ -217,6 +226,13 @@ if ($foundIssues.Count -eq 0) {
         }
     } catch {
         Write-Log "Ошибка DISM: $_" "Red"
+    }
+
+    # Запрос подтверждения перед запуском SFC
+    $sfcConfirm = Read-Host "Запустить SFC /scannow для проверки системы? (Y/N)"
+    if ($sfcConfirm -ne "Y" -and $sfcConfirm -ne "y") {
+        Write-Log "SFC не запущен — пользователь отказался." "Yellow"
+        exit 0
     }
 
     # Запуск SFC
