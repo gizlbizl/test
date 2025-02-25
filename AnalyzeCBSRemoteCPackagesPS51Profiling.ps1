@@ -69,24 +69,17 @@ $errorPatterns = @(
 # Анализ CBS.log
 $foundIssues = @()
 $missingComponents = @()
-$lineCount = (Get-Content $CBSLogPath @encodingParam -Raw | Measure-Object -Line).Lines
-$progress = 0
 
-Get-Content $CBSLogPath @encodingParam -ReadCount 1000 | ForEach-Object {
-    $progress += 1000
-    # Ограничение PercentComplete до 100
-    $percentComplete = [Math]::Min((($progress / $lineCount) * 100), 100)
-    Write-Progress -Activity "Анализ CBS.log" -Status "$progress из $lineCount строк" -PercentComplete $percentComplete
-    foreach ($line in $_) {
-        foreach ($pattern in $errorPatterns) {
-            if ($line -match $pattern) {
-                Write-Log "Найдено совпадение: $line" "Yellow"
-                $foundIssues += $line
-                if ($line -match "missing.*component.*(\S+)") {
-                    $missingComponents += $Matches[1]
-                } elseif ($line -match "CBS MUM Missing.*(\S+)") {
-                    $missingComponents += $Matches[1]
-                }
+Write-Log "Начало анализа файла CBS.log..." "Cyan"
+Get-Content $CBSLogPath @encodingParam | ForEach-Object {
+    foreach ($pattern in $errorPatterns) {
+        if ($_ -match $pattern) {
+            Write-Log "Найдено совпадение: $_" "Yellow"
+            $foundIssues += $_
+            if ($_ -match "missing.*component.*(\S+)") {
+                $missingComponents += $Matches[1]
+            } elseif ($_ -match "CBS MUM Missing.*(\S+)") {
+                $missingComponents += $Matches[1]
             }
         }
     }
