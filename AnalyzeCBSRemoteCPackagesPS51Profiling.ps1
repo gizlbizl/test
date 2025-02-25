@@ -1,5 +1,5 @@
 # Скрипт для анализа CBS.log и восстановления через DISM с использованием \\server\c$\windows
-# Требуются права администратора, совместим с PowerShell 5.1
+# Требуются права администратора, совместим с PowerShell 5.1, с поддержкой кодировки
 
 param (
     [string]$CBSLogPath = "$env:windir\Logs\CBS\CBS.log",
@@ -14,14 +14,15 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit 1
 }
 
-# Создание файла лога
+# Создание файла лога с явной кодировкой UTF-8
 New-Item -Path $LogFile -ItemType File -Force | Out-Null
+Set-Content -Path $LogFile -Value "" -Encoding UTF8  # Инициализация пустого файла в UTF-8
 
 function Write-Log {
     param ([string]$Message, [string]$Color = "White")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host "$timestamp - $Message" -ForegroundColor $Color
-    "$timestamp - $Message" | Out-File -FilePath $LogFile -Append
+    "$timestamp - $Message" | Out-File -FilePath $LogFile -Append -Encoding UTF8
 }
 
 Write-Log "Начало анализа CBS.log..." "Cyan"
@@ -30,6 +31,28 @@ Write-Log "Начало анализа CBS.log..." "Cyan"
 if (-not (Test-Path $CBSLogPath)) {
     Write-Log "Ошибка: Файл CBS.log не найден по пути $CBSLogPath." "Red"
     exit 1
+}
+
+# Определение кодировки CBS.log
+function Get-FileEncoding {
+    param ([string]$Path)
+    $bytes = Get-Content -Path $Path -Encoding Byte -TotalCount 4
+    if ($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { return "UTF16-LE" }
+    elseif ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { return "UTF16-BE" }
+    elseif ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return "UTF8" }
+    else { return "Default" }  # Обычно Windows-1252 или OEM
+}
+
+$cbsEncoding = Get-FileEncoding -Path $CBSLogPath
+Write-Log "Обнаружена кодировка CBS.log: $cbsEncoding" "Cyan"
+
+# Настройка параметров чтения в зависимости от кодировки
+$encodingParam = @{}
+switch ($cbsEncoding) {
+    "UTF16-LE" { $encodingParam["Encoding"] = "Unicode" }
+    "UTF16-BE" { $encodingParam["Encoding"] = "BigEndianUnicode" }
+    "UTF8" { $encodingParam["Encoding"] = "UTF8" }
+    "Default" { $encodingParam["Encoding"] = "Default" }  # Windows-1252
 }
 
 # Сложные маски для поиска ошибок
@@ -42,13 +65,13 @@ $errorPatterns = @(
     "CBS MUM Missing"
 )
 
-# Анализ CBS.log с потоковым чтением
+# Анализ CBS.log с учетом кодировки
 $foundIssues = @()
 $missingComponents = @()
-$lineCount = (Get-Content $CBSLogPath -Raw | Measure-Object -Line).Lines
+$lineCount = (Get-Content $CBSLogPath @encodingParam -Raw | Measure-Object -Line).Lines
 $progress = 0
 
-Get-Content $CBSLogPath -ReadCount 1000 | ForEach-Object {
+Get-Content $CBSLogPath @encodingParam -ReadCount 1000 | ForEach-Object {
     $progress += 1000
     Write-Progress -Activity "Анализ CBS.log" -Status "$progress из $lineCount строк" -PercentComplete (($progress / $lineCount) * 100)
     foreach ($line in $_) {
@@ -86,14 +109,14 @@ if ($foundIssues.Count -eq 0) {
     $sourceServer = $null
     $jobs = @()
 
-    # Параллельная проверка серверов с помощью Start-Job и профилированием поиска
+    # Параллельная проверка серверов с профилированием поиска
     foreach ($server in $serverList) {
         $jobs += Start-Job -ScriptBlock {
             param ($server, $missingComponents, $logFile)
             function Write-JobLog {
                 param ([string]$Message)
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                "$timestamp - $Message" | Out-File -FilePath $logFile -Append
+                "$timestamp - $Message" | Out-File -FilePath $logFile -Append -Encoding UTF8
             }
             
             if (Test-Connection -ComputerName $server -Count 1 -Quiet -ErrorAction SilentlyContinue) {
@@ -103,7 +126,6 @@ if ($foundIssues.Count -eq 0) {
                     $allComponentsPresent = $true
                     
                     foreach ($component in $missingComponents) {
-                        # Профилирование поиска с Measure-Command
                         $searchTime = Measure-Command {
                             $found = Get-ChildItem -Path $winSxSPath -Filter "*$component*" -Directory -ErrorAction SilentlyContinue
                         }
@@ -122,7 +144,7 @@ if ($foundIssues.Count -eq 0) {
         } -ArgumentList $server, $missingComponents, $LogFile
     }
 
-    # Ожидание завершения всех заданий и сбор результатов
+    # Ожидание завершения заданий и сбор результатов
     Write-Log "Ожидание проверки серверов..." "Cyan"
     $jobs | Wait-Job | Out-Null
     foreach ($job in $jobs) {
