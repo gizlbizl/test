@@ -82,9 +82,9 @@ function Filter-LogByDate {
     return $false
 }
 
-# Паттерны для поиска всех отсутствующих компонентов (обновлены для универсальности)
+# Паттерны для поиска всех отсутствующих компонентов (на основе примеров из ссылок)
 $componentPatterns = @(
-    "\(p\) CBS Catalog Missing Package.*for\s+(.+)",               # Любые отсутствующие пакеты, например, Package_4018_for_KB4516044~...
+    "\(p\) CBS Catalog Missing Package.*for\s+(.+)",               # Отсутствующий пакет, например, Package_4018_for_KB4516044~...
     "CBS Manifest Corruption:\d+",                                # Коррупция манифеста, например, CBS Manifest Corruption:53
     "missing.*component\s+(.+)",                                  # Отсутствующий компонент (любой формат)
     "CBS MUM Missing.*for\s+(.+)",                                # Отсутствующий MUM-файл (любой формат)
@@ -124,7 +124,7 @@ try {
                 if ($componentName -and $componentName -ne "") {
                     # Очистка имени компонента от лишних пробелов и символов
                     $componentName = $componentName.Trim()
-                    # Проверка на валидность (не пустое и не только пробелы)
+                    # Проверка на валидность (не пустое и содержит буквы/цифры)
                     if ($componentName -match "[A-Za-z0-9]") {
                         Write-Log "Извлечен отсутствующий компонент: '$componentName'" "INFO" "Green"
                         $missingComponents += $componentName
