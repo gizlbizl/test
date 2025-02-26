@@ -95,15 +95,20 @@ Get-Content $CBSLogPath @encodingParam -ReadCount 1000 | ForEach-Object {
         
         foreach ($pattern in $errorPatterns) {
             if ($_ -match $pattern) {
-                Write-Log "Найдено совпадение: $_" "WARNING" "Yellow"
+                Write-Log "Найдено совпадение (шаблон): $_" "WARNING" "Yellow"
                 $foundIssues += $_
             }
         }
-        # Извлечение пакета после "for" (например, KB4503267-31bf3856ad364e35)
-        if ($_ -match "\(p\) CBS Catalog Missing Package.*for (\w+-\w+)") {
-            $packageName = $Matches[1]
+        # Улучшенное регулярное выражение для извлечения пакета
+        if ($_ -match "\(p\) CBS Catalog Missing Package\s+\d+\s+for\s+(\w+-\w+(?:-\w+)*)") {
+            $packageName = $Matches[1]  # Извлекаем, например, KB4503267-31bf3856ad364e35-amd64-10.1.4
             Write-Log "Извлечен пакет: $packageName" "INFO" "Yellow"
             $missingComponents += $packageName
+        } else {
+            # Отладочный вывод для строк, содержащих (p)
+            if ($_ -match "\(p\)") {
+                Write-Log "Строка с (p), но не обработана: $_" "WARNING" "Yellow"
+            }
         }
     }
 }
@@ -119,7 +124,7 @@ if ($foundIssues.Count -eq 0) {
     Write-Log "Обнаружено проблем: $($foundIssues.Count). Отсутствующих компонентов: $($missingComponents.Count)." "WARNING" "Yellow"
     
     if ($missingComponents.Count -eq 0) {
-        Write-Log "Ошибка: Не удалось определить отсутствующие компоненты для восстановления." "ERROR" "Red"
+        Write-Log "Ошибка: Не удалось определить отсутствующие компоненты для восстановления. Проверьте отладочные сообщения в логе." "ERROR" "Red"
         exit 1
     }
 }
@@ -178,8 +183,8 @@ foreach ($server in $serverList) {
 
                 foreach ($component in $missingComponents) {
                     $searchTime = Measure-Command {
-                        $foundInWinSxS = Get-ChildItem -Path $winSxSPath -Filter "*$component*" -Directory -ErrorAction SilentlyContinue -Timeout $timeoutSeconds
-                        $foundInServicing = Get-ChildItem -Path $servicingPath -Filter "*$component*" -File -ErrorAction SilentlyContinue -Timeout $timeoutSeconds
+                        $foundInWinSxS = Get-ChildItem -Path $winSxSPath -Filter "*$component*" -Directory -ErrorAction SilentlyContinue
+                        $foundInServicing = Get-ChildItem -Path $servicingPath -Filter "*$component*" -File -ErrorAction SilentlyContinue
                         $found = ($foundInWinSxS -or $foundInServicing)
                     }
                     Write-JobLog "Поиск компонента $component на $server занял $($searchTime.TotalSeconds) секунд"
