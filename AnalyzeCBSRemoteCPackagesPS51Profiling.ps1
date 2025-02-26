@@ -2,7 +2,6 @@
 param (
     [string]$CBSLogPath = "$env:SystemRoot\Logs\CBS\CBS.log",  # Путь к CBS.log
     [string]$LogDir = "C:\Temp",                               # Каталог для логов
-    [int]$MaxLogDays = 7,                                      # Анализировать записи не старше N дней
     [string]$Encoding = "UTF8"                                 # Кодировка файла (UTF8, Unicode, Default)
 )
 
@@ -66,25 +65,9 @@ switch ($Encoding.ToUpper()) {
 }
 Write-Log "Используется кодировка: $($encodingParam['Encoding'])" "INFO" "Cyan"
 
-# Фильтрация по дате в CBS.log (временно отключена для диагностики)
-$maxDate = (Get-Date).AddDays(-$MaxLogDays)
-function Filter-LogByDate {
-    param ([string]$Line)
-    if ($Line -match "^\d{4}-\d{2}-\d{2}") {
-        try {
-            $logDate = [datetime]::ParseExact($Line.Substring(0, 10), "yyyy-MM-dd", $null)
-            return $logDate -ge $maxDate
-        } catch {
-            Write-Log "Ошибка парсинга даты в строке: '$Line'. Ошибка: $($_.Exception.Message)" "WARNING" "Yellow"
-            return $false
-        }
-    }
-    return $false
-}
-
 # Паттерны для поиска всех отсутствующих компонентов (обновлены для точности)
 $componentPatterns = @(
-    "\(p\) CBS Catalog Missing Package.*for\s+(.+)",               # Отсутствующий пакет, например, Package_4086_for_KB4516044~...
+    "\(p\) CBS Catalog Missing\s+(.+)",                           # Отсутствующий пакет, например, Package_4086_for_KB4516044~...
     "CBS Manifest Corruption:\d+",                                # Коррупция манифеста, например, CBS Manifest Corruption:53
     "missing.*component\s+(.+)",                                  # Отсутствующий компонент (любой формат)
     "CBS MUM Missing.*for\s+(.+)",                                # Отсутствующий MUM-файл (любой формат)
@@ -96,7 +79,7 @@ $componentPatterns = @(
 $foundIssues = @()
 $missingComponents = @()
 
-Write-Log "Начало анализа файла CBS.log на отсутствие компонентов (за последние $MaxLogDays дней)..." "INFO" "Cyan"
+Write-Log "Начало анализа файла CBS.log на отсутствие компонентов..." "INFO" "Cyan"
 try {
     $totalLines = (Get-Content $CBSLogPath @encodingParam -ReadCount 0 -ErrorAction Stop).Count
 } catch {
@@ -106,7 +89,6 @@ try {
 $progress = 0
 
 try {
-    # Временно отключаем фильтр по дате для диагностики
     Get-Content $CBSLogPath @encodingParam -ReadCount 1000 -ErrorAction Stop | ForEach-Object {
         $progress++
         Write-Progress -Activity "Анализ CBS.log" -Status "$progress из $totalLines строк" -PercentComplete (($progress / $totalLines) * 100)
@@ -118,7 +100,7 @@ try {
             }
         }
         # Извлечение деталей всех отсутствующих компонентов с улучшенным регулярным выражением
-        if ($_ -match "\(p\) CBS Catalog Missing Package.*for\s+([A-Za-z0-9_]+_for_[A-Za-z0-9]+~[A-Za-z0-9]+~[A-Za-z0-9]+~~[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)") {
+        if ($_ -match "\(p\) CBS Catalog Missing\s+([A-Za-z0-9_]+_for_[A-Za-z0-9]+~[A-Za-z0-9]+~[A-Za-z0-9]+~~[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)") {
             $packageName = $Matches[1]  # Извлекаем, например, Package_4086_for_KB4516044~31bf3856ad364e35~amd64~~10.0.1.4
             Write-Log "Извлечен отсутствующий пакет: '$packageName'" "INFO" "Green"
             $missingComponents += $packageName
@@ -145,7 +127,7 @@ try {
             $missingComponents += $payloadName
         }
         elseif ($_ -match "corrupt.*file\s+([A-Za-z0-9_~]+(?:[~.\-_][A-Za-z0-9]+)*)") {
-            $fileName = $Matches[1]  # Извлекаем имя повреждённого файла
+            $fileName = $Matches[1]  # Изvлекаем имя повреждённого файла
             Write-Log "Обнаружен повреждённый файл: '$fileName'" "WARNING" "Yellow"
             $missingComponents += $fileName
         }
