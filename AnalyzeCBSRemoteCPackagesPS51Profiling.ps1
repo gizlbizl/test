@@ -69,22 +69,21 @@ function Filter-LogByDate {
     return $false
 }
 
-# Сложные маски для поиска ошибок
+# Сложные маски для поиска отсутствующих компонентов
 $errorPatterns = @(
-    "Error.*0x[0-9A-Fa-f]{8}",
-    "failed.*HRESULT=0x[0-9A-Fa-f]{8}",
-    "missing.*component",
-    "corrupt.*file",
-    "CSI Payload Corrupt",
-    "CBS MUM Missing",
-    "\(p\) CBS Catalog Missing Package.*for"
+    "\(p\) CBS Catalog Missing Package.*for",         # Отсутствующий пакет, например, KB4503267-...
+    "CBS Manifest Corruption:\d+",                   # Коррупция манифеста, например, CBS Manifest Corruption:53
+    "missing.*component",                            # Отсутствующий компонент
+    "CBS MUM Missing.*for\s+\w+",                    # Отсутствующий MUM-файл
+    "CSI Payload Corrupt",                           # Повреждённый полезный груз
+    "corrupt.*file"                                  # Повреждённый файл
 )
 
-# Анализ CBS.log
+# Анализ CBS.log на отсутствующие компоненты
 $foundIssues = @()
 $missingComponents = @()
 
-Write-Log "Начало анализа файла CBS.log (за последние $MaxLogDays дней)..." "INFO" "Cyan"
+Write-Log "Начало анализа файла CBS.log на отсутствие компонентов (за последние $MaxLogDays дней)..." "INFO" "Cyan"
 $totalLines = (Get-Content $CBSLogPath @encodingParam -ReadCount 0).Count
 $progress = 0
 
@@ -99,15 +98,42 @@ Get-Content $CBSLogPath @encodingParam -ReadCount 1000 | ForEach-Object {
                 $foundIssues += $_
             }
         }
-        # Улучшенное регулярное выражение для извлечения пакета
+        # Извлечение деталей отсутствующих компонентов
         if ($_ -match "\(p\) CBS Catalog Missing Package\s+\d+\s+for\s+(\w+-\w+(?:-\w+)*)") {
             $packageName = $Matches[1]  # Извлекаем, например, KB4503267-31bf3856ad364e35-amd64-10.1.4
-            Write-Log "Извлечен пакет: $packageName" "INFO" "Yellow"
+            Write-Log "Извлечен отсутствующий пакет: $packageName" "INFO" "Yellow"
             $missingComponents += $packageName
-        } else {
-            # Отладочный вывод для строк, содержащих (p)
-            if ($_ -match "\(p\)") {
-                Write-Log "Строка с (p), но не обработана: $_" "WARNING" "Yellow"
+        }
+        elseif ($_ -match "CBS Manifest Corruption:(\d+)") {
+            $corruptionCode = $Matches[1]  # Извлекаем код, например, 53
+            $corruptionKey = "CBS_Manifest_Corruption_$corruptionCode"
+            Write-Log "Обнаружена коррупция манифеста CBS: Код $corruptionCode" "WARNING" "Yellow"
+            $missingComponents += $corruptionKey
+        }
+        elseif ($_ -match "missing.*component\s+(\w+(?:-\w+)*)") {
+            $componentName = $Matches[1]  # Извлекаем имя компонента, например, имя файла или пакета
+            Write-Log "Обнаружен отсутствующий компонент: $componentName" "WARNING" "Yellow"
+            $missingComponents += $componentName
+        }
+        elseif ($_ -match "CBS MUM Missing.*for\s+(\w+(?:-\w+)*)") {
+            $mumName = $Matches[1]  # Извлекаем имя отсутствующего MUM-файла
+            Write-Log "Обнаружен отсутствующий MUM-файл: $mumName" "WARNING" "Yellow"
+            $missingComponents += $mumName
+        }
+        elseif ($_ -match "CSI Payload Corrupt.*for\s+(\w+(?:-\w+)*)") {
+            $payloadName = $Matches[1]  # Извлекаем имя повреждённого полезного груза
+            Write-Log "Обнаружен повреждённый полезный груз: $payloadName" "WARNING" "Yellow"
+            $missingComponents += $payloadName
+        }
+        elseif ($_ -match "corrupt.*file\s+(\w+(?:-\w+)*)") {
+            $fileName = $Matches[1]  # Извлекаем имя повреждённого файла
+            Write-Log "Обнаружен повреждённый файл: $fileName" "WARNING" "Yellow"
+            $missingComponents += $fileName
+        }
+        else {
+            # Расширенный отладочный вывод для строк, соответствующих ключевым словам
+            if ($_.Contains("(p)") -or $_.Contains("missing") -or $_.Contains("corrupt") -or $_.Contains("CBS Manifest Corruption")) {
+                Write-Log "Строка с потенциальным отсутствующим компонентом, но не обработана: $_" "WARNING" "Yellow"
             }
         }
     }
