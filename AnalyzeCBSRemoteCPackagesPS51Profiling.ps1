@@ -46,7 +46,7 @@ function Write-Log {
     }
 }
 
-Write-Log "Начало ускоренного анализа CBS.log на отсутствие компонентов после последней 'Checking System Update Readiness'..." "INFO" "Cyan"
+Write-Log "Начало ускоренного анализа CBS.log на отсутствие пакетов (p) CBS Catalog Missing после последней 'Checking System Update Readiness'..." "INFO" "Cyan"
 
 # Проверка существования CBS.log
 if (-not (Test-Path $CBSLogPath)) {
@@ -65,17 +65,10 @@ switch ($Encoding.ToUpper()) {
 }
 Write-Log "Используется кодировка: $($encodingParam['Encoding'])" "INFO" "Cyan"
 
-# Паттерны для поиска отсутствующих компонентов (оптимизированы для скорости)
-$componentPatterns = @(
-    "\(p\)\s*CBS\s*Catalog\s*Missing\s+(.+)",                   # Отсутствующий пакет, например, Package_5420_for_KB4503267~...
-    "CBS\s*Manifest\s*Corruption:\d+",                          # Коррупция манифеста, например, CBS Manifest Corruption:53
-    "missing.*component\s+(.+)",                                # Отсутствующий компонент (любой формат)
-    "CBS\s*MUM\s*Missing.*for\s+(.+)",                          # Отсутствующий MUM-файл (любой формат)
-    "CSI\s*Payload\s*Corrupt.*for\s+(.+)",                      # Повреждённый полезный груз (любой формат)
-    "corrupt.*file\s+(.+)"                                      # Повреждённый файл (любой формат)
-)
+# Паттерн для поиска только (p) CBS Catalog Missing пакетов
+$componentPattern = "\(p\)\s*CBS\s*Catalog\s*Missing\s+([A-Za-z0-9_]+_for_[A-Za-z0-9]+~[A-Za-z0-9]+~[A-Za-z0-9]+~~[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"
 
-# Ускоренный анализ CBS.log на отсутствующие компоненты начиная с последней 'Checking System Update Readiness'
+# Ускоренный анализ CBS.log на отсутствующие пакеты начиная с последней 'Checking System Update Readiness'
 $foundIssues = @()
 $missingComponents = @()
 
@@ -94,7 +87,7 @@ try {
     Write-Log "Найдена последняя строка начала анализа: '$($lastStartLine.Line)' (строка $startLineNumber)" "INFO" "Green"
 
     # Считываем только строки после последней найденной с использованием Select-String для ключевых слов
-    $relevantLines = Select-String -Path $CBSLogPath -Pattern "(p)|missing|corrupt|CBS Manifest Corruption|CSI" `
+    $relevantLines = Select-String -Path $CBSLogPath -Pattern "\(p\)" `
         -AfterContext 0 `
         -Context ($startLineNumber, [int]::MaxValue) `
         -Encoding $encodingParam.Encoding `
@@ -110,35 +103,33 @@ try {
         
         Write-Log "Обработка строки: '$line'" "DEBUG" "Gray"
         
-        foreach ($pattern in $componentPatterns) {
-            if ($line -match $pattern) {
-                Write-Log "Найдено совпадение (компонент): '$line' (паттерн: $pattern)" "WARNING" "Yellow"
-                $foundIssues += $line
-                
-                # Извлечение компонента
-                $componentName = $Matches[1]
-                if ($componentName -and $componentName -ne "") {
-                    $componentName = $componentName.Trim()
-                    if ($componentName -match "[A-Za-z0-9]") {
-                        Write-Log "Извлечён компонент: '$componentName'" "INFO" "Green"
-                        $missingComponents += $componentName
-                    } else {
-                        Write-Log "Не удалось извлечь валидное имя компонента из строки: '$line' (паттерн: $pattern)" "WARNING" "Yellow"
-                    }
+        if ($line -match $componentPattern) {
+            Write-Log "Найдено совпадение (пакет): '$line'" "WARNING" "Yellow"
+            $foundIssues += $line
+            
+            # Извлечение пакета
+            $packageName = $Matches[1]
+            if ($packageName -and $packageName -ne "") {
+                $packageName = $packageName.Trim()
+                if ($packageName -match "[A-Za-z0-9]") {
+                    Write-Log "Извлечён пакет: '$packageName'" "INFO" "Green"
+                    $missingComponents += $packageName
                 } else {
-                    Write-Log "Не удалось извлечь имя компонента из строки: '$line' (паттерн: $pattern)" "WARNING" "Yellow"
+                    Write-Log "Не удалось извлечь валидное имя пакета из строки: '$line'" "WARNING" "Yellow"
                 }
+            } else {
+                Write-Log "Не удалось извлечь имя пакета из строки: '$line'" "WARNING" "Yellow"
             }
+        } else {
+            Write-Log "Строка не соответствует паттерну: '$line'" "DEBUG" "Gray"
         }
         
-        # Отладочный вывод для нераспознанных строк
-        if ($line.Contains("(p)") -or $line.Contains("missing") -or $line.Contains("corrupt") -or $line.Contains("CBS Manifest Corruption")) {
+        # Отладочный вывод для нераспознанных строк с (p)
+        if ($line.Contains("(p)")) {
             $isProcessed = $false
-            foreach ($pattern in $componentPatterns) {
-                if ($line -match $pattern) { $isProcessed = $true; break }
-            }
+            if ($line -match $componentPattern) { $isProcessed = $true }
             if (-not $isProcessed) {
-                Write-Log "Строка с потенциальным отсутствующим компонентом, но не обработана: '$line'" "WARNING" "Yellow"
+                Write-Log "Строка с потенциальным отсутствующим пакетом, но не обработана: '$line'" "WARNING" "Yellow"
             }
         }
     }
@@ -148,22 +139,22 @@ try {
 }
 Write-Progress -Activity "Анализ релевантных строк" -Completed
 
-# Удаление дубликатов компонентов и фильтрация пустых или невалидных значений
+# Удаление дубликатов пакетов и фильтрация пустых или невалидных значений
 $missingComponents = $missingComponents | Sort-Object -Unique | Where-Object { 
     $_ -ne $null -and $_ -ne "" -and $_ -match "[A-Za-z0-9]" 
 }
 
 if ($foundIssues.Count -eq 0) {
-    Write-Log "Отсутствующие компоненты не найдены после последней 'Checking System Update Readiness'." "INFO" "Green"
+    Write-Log "Отсутствующие пакеты не найдены после последней 'Checking System Update Readiness'." "INFO" "Green"
     exit 0
 } else {
-    Write-Log "Обнаружено проблем: $($foundIssues.Count). Отсутствующих компонентов: $($missingComponents.Count)" "WARNING" "Yellow"
+    Write-Log "Обнаружено проблем: $($foundIssues.Count). Отсутствующих пакетов: $($missingComponents.Count)" "WARNING" "Yellow"
     
     if ($missingComponents.Count -eq 0) {
-        Write-Log "Не удалось определить отсутствующие компоненты. Проверьте отладочные сообщения в логе." "ERROR" "Red"
+        Write-Log "Не удалось определить отсутствующие пакеты. Проверьте отладочные сообщения в логе." "ERROR" "Red"
         exit 1
     }
-    Write-Log "Список отсутствующих компонентов: '$($missingComponents -join ', ')'" "INFO" "Cyan"
+    Write-Log "Список отсутствующих пакетов: '$($missingComponents -join ', ')'" "INFO" "Cyan"
 }
 
 Write-Log "Анализ CBS.log завершён. Обработано релевантных строк: $progress" "INFO" "Green"
