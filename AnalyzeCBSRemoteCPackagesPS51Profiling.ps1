@@ -6,7 +6,7 @@ param (
     [int]$ProjectStart = 1,      # Начальный номер проекта
     [int]$ProjectEnd = 0,        # Конечный номер проекта (0 = не задан)
     [int]$ProjectCount = 0,      # Количество проектов от ProjectStart
-    [int]$MaxLogDays = 7,        # Анализировать записи не старше N дней
+    [int]$MaxLogDays = 7,        # Анализировать записи не старше N дней (можно отключить для теста)
     [int]$MaxConcurrentJobs = 5  # Максимум одновременных заданий для серверов
 )
 
@@ -85,7 +85,7 @@ switch ($encoding) {
     "Default" { $encodingParam["Encoding"] = "Default" }
 }
 
-# Фильтрация по дате в CBS.log
+# Фильтрация по дате в CBS.log (временно отключена для диагностики)
 $maxDate = (Get-Date).AddDays(-$MaxLogDays)
 function Filter-LogByDate {
     param ([string]$Line)
@@ -101,7 +101,7 @@ function Filter-LogByDate {
     return $false
 }
 
-# Паттерны для поиска отсутствующих компонентов
+# Паттерны для поиска отсутствующих компонентов (обновлены для точности)
 $errorPatterns = @(
     "\(p\) CBS Catalog Missing Package.*for",         # Отсутствующий пакет, например, KB4503267-...
     "CBS Manifest Corruption:\d+",                   # Коррупция манифеста, например, CBS Manifest Corruption:53
@@ -115,7 +115,7 @@ $errorPatterns = @(
 $foundIssues = @()
 $missingComponents = @()
 
-Write-Log "Начало анализа файла CBS.log на отсутствие компонентов (за последние $MaxLogDays дней)..." "INFO" "Cyan"
+Write-Log "Начало анализа файла CBS.log на отсутствие компонентов..." "INFO" "Cyan"
 try {
     $totalLines = (Get-Content $CBSLogPath @encodingParam -ReadCount 0 -ErrorAction Stop).Count
 } catch {
@@ -125,53 +125,52 @@ try {
 $progress = 0
 
 try {
+    # Временно отключаем фильтр по дате для диагностики
     Get-Content $CBSLogPath @encodingParam -ReadCount 1000 -ErrorAction Stop | ForEach-Object {
-        $_.Where({ Filter-LogByDate $_ }) | ForEach-Object {
-            $progress++
-            Write-Progress -Activity "Анализ CBS.log" -Status "$progress из $totalLines строк" -PercentComplete (($progress / $totalLines) * 100)
-            
-            foreach ($pattern in $errorPatterns) {
-                if ($_ -match $pattern) {
-                    Write-Log "Найдено совпадение (шаблон): '$_'" "WARNING" "Yellow"
-                    $foundIssues += $_
-                }
+        $progress++
+        Write-Progress -Activity "Анализ CBS.log" -Status "$progress из $totalLines строк" -PercentComplete (($progress / $totalLines) * 100)
+        
+        foreach ($pattern in $errorPatterns) {
+            if ($_ -match $pattern) {
+                Write-Log "Найдено совпадение (шаблон): '$_'" "WARNING" "Yellow"
+                $foundIssues += $_
             }
-            # Извлечение деталей отсутствующих компонентов
-            if ($_ -match "\(p\) CBS Catalog Missing Package\s+\d+\s+for\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
-                $packageName = $Matches[1]  # Извлекаем, например, KB4503267-31bf3856ad364e35-amd64-10.1.4
-                Write-Log "Извлечен отсутствующий пакет: '$packageName'" "INFO" "Green"
-                $missingComponents += $packageName
-            }
-            elseif ($_ -match "CBS Manifest Corruption:(\d+)") {
-                $corruptionCode = $Matches[1]  # Извлекаем код, например, 53
-                $corruptionKey = "CBS_Manifest_Corruption_$corruptionCode"
-                Write-Log "Обнаружена коррупция манифеста CBS: Код $corruptionCode" "WARNING" "Yellow"
-                $missingComponents += $corruptionKey
-            }
-            elseif ($_ -match "missing.*component\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
-                $componentName = $Matches[1]  # Извлекаем имя компонента, например, имя файла или пакета
-                Write-Log "Обнаружен отсутствующий компонент: '$componentName'" "WARNING" "Yellow"
-                $missingComponents += $componentName
-            }
-            elseif ($_ -match "CBS MUM Missing.*for\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
-                $mumName = $Matches[1]  # Извлекаем имя отсутствующего MUM-файла
-                Write-Log "Обнаружен отсутствующий MUM-файл: '$mumName'" "WARNING" "Yellow"
-                $missingComponents += $mumName
-            }
-            elseif ($_ -match "CSI Payload Corrupt.*for\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
-                $payloadName = $Matches[1]  # Извлекаем имя повреждённого полезного груза
-                Write-Log "Обнаружен повреждённый полезный груз: '$payloadName'" "WARNING" "Yellow"
-                $missingComponents += $payloadName
-            }
-            elseif ($_ -match "corrupt.*file\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
-                $fileName = $Matches[1]  # Извлекаем имя повреждённого файла
-                Write-Log "Обнаружен повреждённый файл: '$fileName'" "WARNING" "Yellow"
-                $missingComponents += $fileName
-            }
-            else {
-                if ($_.Contains("(p)") -or $_.Contains("missing") -or $_.Contains("corrupt") -or $_.Contains("CBS Manifest Corruption")) {
-                    Write-Log "Строка с потенциальным отсутствующим компонентом, но не обработана: '$_'" "WARNING" "Yellow"
-                }
+        }
+        # Извлечение деталей отсутствующих компонентов с улучшенным регулярным выражением
+        if ($_ -match "\(p\) CBS Catalog Missing Package\s+\d+\s+for\s+([A-Za-z0-9-]+\.[A-Za-z0-9-]+\.[A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
+            $packageName = $Matches[1]  # Извлекаем, например, KB4503267-31bf3856ad364e35-amd64-10.1.4
+            Write-Log "Извлечен отсутствующий пакет: '$packageName'" "INFO" "Green"
+            $missingComponents += $packageName
+        }
+        elseif ($_ -match "CBS Manifest Corruption:(\d+)") {
+            $corruptionCode = $Matches[1]  # Извлекаем код, например, 53
+            $corruptionKey = "CBS_Manifest_Corruption_$corruptionCode"
+            Write-Log "Обнаружена коррупция манифеста CBS: Код $corruptionCode" "WARNING" "Yellow"
+            $missingComponents += $corruptionKey
+        }
+        elseif ($_ -match "missing.*component\s+([A-Za-z0-9-]+\.[A-Za-z0-9-]+\.[A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
+            $componentName = $Matches[1]  # Извлекаем имя компонента, например, имя файла или пакета
+            Write-Log "Обнаружен отсутствующий компонент: '$componentName'" "WARNING" "Yellow"
+            $missingComponents += $componentName
+        }
+        elseif ($_ -match "CBS MUM Missing.*for\s+([A-Za-z0-9-]+\.[A-Za-z0-9-]+\.[A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
+            $mumName = $Matches[1]  # Извлекаем имя отсутствующего MUM-файла
+            Write-Log "Обнаружен отсутствующий MUM-файл: '$mumName'" "WARNING" "Yellow"
+            $missingComponents += $mumName
+        }
+        elseif ($_ -match "CSI Payload Corrupt.*for\s+([A-Za-z0-9-]+\.[A-Za-z0-9-]+\.[A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
+            $payloadName = $Matches[1]  # Извлекаем имя повреждённого полезного груза
+            Write-Log "Обнаружен повреждённый полезный груз: '$payloadName'" "WARNING" "Yellow"
+            $missingComponents += $payloadName
+        }
+        elseif ($_ -match "corrupt.*file\s+([A-Za-z0-9-]+\.[A-Za-z0-9-]+\.[A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
+            $fileName = $Matches[1]  # Извлекаем имя повреждённого файла
+            Write-Log "Обнаружен повреждённый файл: '$fileName'" "WARNING" "Yellow"
+            $missingComponents += $fileName
+        }
+        else {
+            if ($_.Contains("(p)") -or $_.Contains("missing") -or $_.Contains("corrupt") -or $_.Contains("CBS Manifest Corruption")) {
+                Write-Log "Строка с потенциальным отсутствующим компонентом, но не обработана: '$_'" "WARNING" "Yellow"
             }
         }
     }
@@ -181,8 +180,8 @@ try {
 }
 Write-Progress -Activity "Анализ CBS.log" -Completed
 
-# Удаление дубликатов компонентов
-$missingComponents = $missingComponents | Sort-Object -Unique | Where-Object { $_ -ne $null }
+# Удаление дубликатов компонентов и фильтрация пустых значений
+$missingComponents = $missingComponents | Sort-Object -Unique | Where-Object { $_ -ne $null -and $_ -ne "" }
 
 if ($foundIssues.Count -eq 0) {
     Write-Log "Ошибки или отсутствующие компоненты не найдены." "INFO" "Green"
