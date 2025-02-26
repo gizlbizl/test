@@ -18,28 +18,37 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 # Создание директории для логов и файла лога
 $LogDir = Join-Path $LogDir "RepairLogs"
 try {
-    if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path $LogDir)) { 
+        New-Item -Path $LogDir -ItemType Directory -Force | Out-Null 
+    }
 } catch {
-    Write-Log "Ошибка: Не удалось создать директорию $LogDir. Проверьте права доступа. Ошибка: $_" "ERROR" "Red"
+    $errorMessage = "Не удалось создать директорию `"$LogDir`". Проверьте права доступа. Ошибка: $($_)"
+    Write-Log $errorMessage "ERROR" "Red"
     exit 1
 }
 $LogFile = Join-Path $LogDir "RepairLog_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 try {
     New-Item -Path $LogFile -ItemType File -Force | Out-Null
 } catch {
-    Write-Log "Ошибка: Не удалось создать файл лога $LogFile. Проверьте права доступа. Ошибка: $_" "ERROR" "Red"
+    $errorMessage = "Не удалось создать файл лога `"$LogFile`". Проверьте права доступа. Ошибка: $($_)"
+    Write-Log $errorMessage "ERROR" "Red"
     exit 1
 }
 
 function Write-Log {
-    param ([string]$Message, [string]$Level = "INFO", [string]$Color = "White")
+    param (
+        [string]$Message,
+        [string]$Level = "INFO",
+        [string]$Color = "White"
+    )
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "$timestamp [$Level] - $Message"
     Write-Host $logEntry -ForegroundColor $Color
     try {
-        $logEntry | Out-File -FilePath $LogFile -Append -Encoding UTF8
+        # Используем двойные кавычки для интерполяции и экранируем специальные символы
+        $logEntry | Out-File -FilePath $LogFile -Append -Encoding UTF8 -ErrorAction Stop
     } catch {
-        Write-Host "Ошибка записи в лог: $_" -ForegroundColor Red
+        Write-Host "Ошибка записи в лог: $($_)" -ForegroundColor Red
     }
 }
 
@@ -47,7 +56,8 @@ Write-Log "Начало анализа CBS.log..." "INFO" "Cyan"
 
 # Проверка существования CBS.log
 if (-not (Test-Path $CBSLogPath)) {
-    Write-Log "Ошибка: Файл CBS.log не найден по пути $CBSLogPath. Укажите правильный путь с -CBSLogPath." "ERROR" "Red"
+    $errorMessage = "Файл CBS.log не найден по пути `"$CBSLogPath`". Укажите правильный путь с -CBSLogPath."
+    Write-Log $errorMessage "ERROR" "Red"
     exit 1
 }
 
@@ -61,7 +71,8 @@ function Get-FileEncoding {
         elseif ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return "UTF8" }
         else { return "Default" }
     } catch {
-        Write-Log "Ошибка определения кодировки CBS.log: $_" "ERROR" "Red"
+        $errorMsg = "Ошибка определения кодировки CBS.log: $($_)"
+        Write-Log $errorMsg "ERROR" "Red"
         return "Default"
     }
 }
@@ -86,7 +97,8 @@ function Filter-LogByDate {
             $logDate = [datetime]::ParseExact($Line.Substring(0, 10), "yyyy-MM-dd", $null)
             return $logDate -ge $maxDate
         } catch {
-            Write-Log "Ошибка парсинга даты в строке: $Line. Ошибка: $_" "WARNING" "Yellow"
+            $warningMsg = "Ошибка парсинга даты в строке: `"$Line`". Ошибка: $($_)"
+            Write-Log $warningMsg "WARNING" "Yellow"
             return $false
         }
     }
@@ -111,7 +123,8 @@ Write-Log "Начало анализа файла CBS.log на отсутств�
 try {
     $totalLines = (Get-Content $CBSLogPath @encodingParam -ReadCount 0 -ErrorAction Stop).Count
 } catch {
-    Write-Log "Ошибка чтения CBS.log для подсчёта строк: $_" "ERROR" "Red"
+    $errorMsg = "Ошибка чтения CBS.log для подсчёта строк: $($_)"
+    Write-Log $errorMsg "ERROR" "Red"
     $totalLines = 0
 }
 $progress = 0
@@ -124,14 +137,14 @@ try {
             
             foreach ($pattern in $errorPatterns) {
                 if ($_ -match $pattern) {
-                    Write-Log "Найдено совпадение (шаблон): $_" "WARNING" "Yellow"
+                    Write-Log "Найдено совпадение (шаблон): `"$_`"" "WARNING" "Yellow"
                     $foundIssues += $_
                 }
             }
             # Извлечение деталей отсутствующих компонентов с улучшенным регулярным выражением
             if ($_ -match "\(p\) CBS Catalog Missing Package\s+\d+\s+for\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
                 $packageName = $Matches[1]  # Извлекаем, например, KB4503267-31bf3856ad364e35-amd64-10.1.4
-                Write-Log "Извлечен отсутствующий пакет: $packageName" "INFO" "Green"
+                Write-Log "Извлечен отсутствующий пакет: `"$packageName`"" "INFO" "Green"
                 $missingComponents += $packageName
             }
             elseif ($_ -match "CBS Manifest Corruption:(\d+)") {
@@ -142,34 +155,35 @@ try {
             }
             elseif ($_ -match "missing.*component\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
                 $componentName = $Matches[1]  # Извлекаем имя компонента, например, имя файла или пакета
-                Write-Log "Обнаружен отсутствующий компонент: $componentName" "WARNING" "Yellow"
+                Write-Log "Обнаружен отсутствующий компонент: `"$componentName`"" "WARNING" "Yellow"
                 $missingComponents += $componentName
             }
             elseif ($_ -match "CBS MUM Missing.*for\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
                 $mumName = $Matches[1]  # Извлекаем имя отсутствующего MUM-файла
-                Write-Log "Обнаружен отсутствующий MUM-файл: $mumName" "WARNING" "Yellow"
+                Write-Log "Обнаружен отсутствующий MUM-файл: `"$mumName`"" "WARNING" "Yellow"
                 $missingComponents += $mumName
             }
             elseif ($_ -match "CSI Payload Corrupt.*for\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
                 $payloadName = $Matches[1]  # Извлекаем имя повреждённого полезного груза
-                Write-Log "Обнаружен повреждённый полезный груз: $payloadName" "WARNING" "Yellow"
+                Write-Log "Обнаружен повреждённый полезный груз: `"$payloadName`"" "WARNING" "Yellow"
                 $missingComponents += $payloadName
             }
             elseif ($_ -match "corrupt.*file\s+([A-Za-z0-9-]+(?:-[A-Za-z0-9]+)*)") {
                 $fileName = $Matches[1]  # Извлекаем имя повреждённого файла
-                Write-Log "Обнаружен повреждённый файл: $fileName" "WARNING" "Yellow"
+                Write-Log "Обнаружен повреждённый файл: `"$fileName`"" "WARNING" "Yellow"
                 $missingComponents += $fileName
             }
             else {
                 # Расширенный отладочный вывод для строк, соответствующих ключевым словам
                 if ($_.Contains("(p)") -or $_.Contains("missing") -or $_.Contains("corrupt") -or $_.Contains("CBS Manifest Corruption")) {
-                    Write-Log "Строка с потенциальным отсутствующим компонентом, но не обработана: $_" "WARNING" "Yellow"
+                    Write-Log "Строка с потенциальным отсутствующим компонентом, но не обработана: `"$_`"" "WARNING" "Yellow"
                 }
             }
         }
     }
 } catch {
-    Write-Log "Ошибка анализа CBS.log: $_" "ERROR" "Red"
+    $errorMsg = "Ошибка анализа CBS.log: $($_)"
+    Write-Log $errorMsg "ERROR" "Red"
     exit 1
 }
 Write-Progress -Activity "Анализ CBS.log" -Completed
@@ -184,10 +198,11 @@ if ($foundIssues.Count -eq 0) {
     Write-Log "Обнаружено проблем: $($foundIssues.Count). Отсутствующих компонентов: $($missingComponents.Count)." "WARNING" "Yellow"
     
     if ($missingComponents.Count -eq 0) {
-        Write-Log "Ошибка: Не удалось определить отсутствующие компоненты для восстановления. Проверьте отладочные сообщения в логе." "ERROR" "Red"
+        $errorMsg = "Не удалось определить отсутствующие компоненты для восстановления. Проверьте отладочные сообщения в логе."
+        Write-Log $errorMsg "ERROR" "Red"
         exit 1
     }
-    Write-Log "Список отсутствующих компонентов: $($missingComponents -join ', ')" "INFO" "Cyan"
+    Write-Log "Список отсутствующих компонентов: `"$($missingComponents -join ', ')`"" "INFO" "Cyan"
 }
 
 # Функция для генерации имен серверов
@@ -207,7 +222,8 @@ function Get-ServerNames {
             $servers += "vdc01-pep{0:D2}s001" -f $start
         }
     } catch {
-        Write-Log "Ошибка генерации списка серверов: $_" "ERROR" "Red"
+        $errorMsg = "Ошибка генерации списка серверов: $($_)"
+        Write-Log $errorMsg "ERROR" "Red"
         return @()
     }
     return $servers
@@ -216,10 +232,11 @@ function Get-ServerNames {
 # Генерация списка серверов
 $serverList = Get-ServerNames -start $ProjectStart -end $ProjectEnd -count $ProjectCount
 if ($serverList.Count -eq 0) {
-    Write-Log "Ошибка: Список серверов пуст. Проверьте параметры ProjectStart, ProjectEnd, ProjectCount." "ERROR" "Red"
+    $errorMsg = "Список серверов пуст. Проверьте параметры ProjectStart, ProjectEnd, ProjectCount."
+    Write-Log $errorMsg "ERROR" "Red"
     exit 1
 }
-Write-Log "Сгенерирован список серверов: $($serverList -join ', ')" "INFO" "Cyan"
+Write-Log "Сгенерирован список серверов: `"$($serverList -join ', ')`"" "INFO" "Cyan"
 
 $sourceServer = $null
 $jobs = @()
@@ -229,7 +246,7 @@ $jobCount = 0
 foreach ($server in $serverList) {
     if ($jobCount -ge $MaxConcurrentJobs) {
         $jobs | Wait-Job | ForEach-Object { 
-            try { Receive-Job -Job $_ -ErrorAction Stop } catch { Write-Log "Ошибка получения результатов задания: $_" "ERROR" "Red" }
+            try { Receive-Job -Job $_ -ErrorAction Stop } catch { Write-Log "Ошибка получения результатов задания: $($_)" "ERROR" "Red" }
         } | Out-Null
         $jobs | Remove-Job -Force
         $jobs = @()
@@ -260,14 +277,14 @@ foreach ($server in $serverList) {
                             $foundInServicing = Get-ChildItem -Path $servicingPath -Filter "*$component*" -File -ErrorAction SilentlyContinue
                             $found = ($foundInWinSxS -or $foundInServicing)
                         }
-                        Write-JobLog "Поиск компонента $component на $server занял $($searchTime.TotalSeconds) секунд"
+                        Write-JobLog "Поиск компонента `"$component`" на $server занял $($searchTime.TotalSeconds) секунд"
                         if ($found) {
                             $location = if ($foundInWinSxS) { "WinSxS" } else { "servicing\Packages" }
-                            Write-JobLog "Компонент $component найден в $location на $server" "INFO"
+                            Write-JobLog "Компонент `"$component`" найден в $location на $server" "INFO"
                             $foundComponents += $component
                         } else {
                             $allComponentsPresent = $false
-                            Write-JobLog "Компонент $component НЕ найден на $server" "WARNING"
+                            Write-JobLog "Компонент `"$component`" НЕ найден на $server" "WARNING"
                         }
                     }
 
@@ -278,7 +295,7 @@ foreach ($server in $serverList) {
                         }
                     }
                 } else {
-                    Write-JobLog "Не удалось получить доступ к $sourcePath" "ERROR"
+                    Write-JobLog "Не удалось получить доступ к `"$sourcePath`"" "ERROR"
                 }
             } else {
                 Write-JobLog "Сервер $server недоступен" "ERROR"
@@ -286,7 +303,8 @@ foreach ($server in $serverList) {
         } -ArgumentList $server, $missingComponents, $LogFile -ErrorAction Stop
         $jobCount++
     } catch {
-        Write-Log "Ошибка запуска задания для сервера $server: $_" "ERROR" "Red"
+        $errorMsg = "Ошибка запуска задания для сервера `"$server`": $($_)"
+        Write-Log $errorMsg "ERROR" "Red"
     }
 }
 
@@ -300,32 +318,36 @@ try {
             if ($null -ne $result -and $null -eq $sourceServer) {
                 $sourceServer = $result.Path
                 $foundComponents = $result.Components
-                Write-Log "Выбран сервер: $sourceServer. Найдены компоненты: $($foundComponents -join ', ')" "INFO" "Green"
+                Write-Log "Выбран сервер: `"$sourceServer`". Найдены компоненты: `"$($foundComponents -join ', ')`"" "INFO" "Green"
             }
         } catch {
-            Write-Log "Ошибка получения результатов задания: $_" "ERROR" "Red"
+            $errorMsg = "Ошибка получения результатов задания: $($_)"
+            Write-Log $errorMsg "ERROR" "Red"
         }
         Remove-Job -Job $job -Force
     }
 } catch {
-    Write-Log "Ошибка ожидания завершения заданий: $_" "ERROR" "Red"
+    $errorMsg = "Ошибка ожидания завершения заданий: $($_)"
+    Write-Log $errorMsg "ERROR" "Red"
     $jobs | Remove-Job -Force
 }
 
 if ($null -eq $sourceServer) {
-    Write-Log "Ошибка: Не удалось найти сервер с необходимыми компонентами. Проверьте доступность серверов и пути." "ERROR" "Red"
+    $errorMsg = "Не удалось найти сервер с необходимыми компонентами. Проверьте доступность серверов и пути."
+    Write-Log $errorMsg "ERROR" "Red"
     exit 1
 }
 
 # Проверка наличия всех компонентов перед запуском DISM
 $missingStill = $missingComponents | Where-Object { $_ -notin $foundComponents }
 if ($missingStill.Count -gt 0) {
-    Write-Log "Ошибка: На сервере $sourceServer отсутствуют компоненты: $($missingStill -join ', ')" "ERROR" "Red"
+    $errorMsg = "На сервере `"$sourceServer`" отсутствуют компоненты: `"$($missingStill -join ', ')`""
+    Write-Log $errorMsg "ERROR" "Red"
     exit 1
 }
 
 # Запрос подтверждения перед запуском DISM
-$dismConfirm = Read-Host "Запустить DISM для восстановления с источником $sourceServer? (Y/N)"
+$dismConfirm = Read-Host "Запустить DISM для восстановления с источником `"$sourceServer`"? (Y/N)"
 if ($dismConfirm -notin @("Y", "y")) {
     Write-Log "DISM не запущен — пользователь отказался." "WARNING" "Yellow"
     exit 0
@@ -333,23 +355,26 @@ if ($dismConfirm -notin @("Y", "y")) {
 
 # Проверка доступности DISM
 if (-not (Get-Command "DISM" -ErrorAction SilentlyContinue)) {
-    Write-Log "Ошибка: Утилита DISM не найдена. Проверьте установку Windows." "ERROR" "Red"
+    $errorMsg = "Утилита DISM не найдена. Проверьте установку Windows."
+    Write-Log $errorMsg "ERROR" "Red"
     exit 1
 }
 
 # Запуск DISM
-Write-Log "Все необходимые компоненты найдены. Запуск DISM с источником $sourceServer..." "INFO" "Cyan"
-$dismCommand = "DISM /Online /Cleanup-Image /RestoreHealth /Source:$sourceServer /LimitAccess /LogPath:$DISMLogPath"
+Write-Log "Все необходимые компоненты найдены. Запуск DISM с источником `"$sourceServer`"..."" "INFO" "Cyan"
+$dismCommand = "DISM /Online /Cleanup-Image /RestoreHealth /Source:`"$sourceServer`" /LimitAccess /LogPath:`"$DISMLogPath`""
 
 try {
     $dismResult = Invoke-Expression $dismCommand 2>&1 | ForEach-Object { Write-Log "$_" "INFO" }
     if ($dismResult -match "The restore operation completed successfully") {
         Write-Log "Восстановление завершено успешно!" "INFO" "Green"
     } else {
-        Write-Log "Восстановление не удалось. См. $DISMLogPath для деталей." "ERROR" "Red"
+        $errorMsg = "Восстановление не удалось. См. `"$DISMLogPath`" для деталей."
+        Write-Log $errorMsg "ERROR" "Red"
     }
 } catch {
-    Write-Log "Ошибка DISM: $_" "ERROR" "Red"
+    $errorMsg = "Ошибка DISM: $($_)"
+    Write-Log $errorMsg "ERROR" "Red"
 }
 
 # Запрос подтверждения перед запуском SFC
@@ -361,7 +386,8 @@ if ($sfcConfirm -notin @("Y", "y")) {
 
 # Проверка доступности SFC
 if (-not (Get-Command "sfc" -ErrorAction SilentlyContinue)) {
-    Write-Log "Ошибка: Утилита SFC не найдена. Проверьте установку Windows." "ERROR" "Red"
+    $errorMsg = "Утилита SFC не найдена. Проверьте установку Windows."
+    Write-Log $errorMsg "ERROR" "Red"
     exit 1
 }
 
@@ -370,7 +396,8 @@ Write-Log "Запуск SFC /scannow..." "INFO" "Cyan"
 try {
     $sfcResult = sfc /scannow 2>&1 | ForEach-Object { Write-Log "$_" "INFO" }
 } catch {
-    Write-Log "Ошибка SFC: $_" "ERROR" "Red"
+    $errorMsg = "Ошибка SFC: $($_)"
+    Write-Log $errorMsg "ERROR" "Red"
 }
 
 Write-Log "Анализ и восстановление завершены." "INFO" "Green"
