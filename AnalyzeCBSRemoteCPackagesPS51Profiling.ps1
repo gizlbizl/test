@@ -1,38 +1,36 @@
-# Путь к CBS.log
-$logPath = "C:\Windows\Logs\CBS\CBS.log"
+# Путь к файлу CBS.log
+$cbsLogPath = "$env:SystemRoot\Logs\CBS\CBS.log"
 
 # Проверяем существование файла
-if (Test-Path $logPath) {
-    Write-Host "Анализ CBS.log начат..."
+if (-Not (Test-Path $cbsLogPath)) {
+    Write-Host "Файл CBS.log не найден!"
+    exit
+}
 
-    # Читаем файл и фильтруем строки с ошибками
-    $errorLines = Get-Content $logPath | Where-Object {
-        $_ -match "Error\s+CBS" -and 
-        ($_ -match "missing" -or $_ -match "cannot find" -or $_ -match "0x80070002" -or $_ -match "Failed to resolve")
-    }
+# Чтение файла CBS.log
+$cbsLogContent = Get-Content -Path $cbsLogPath
 
-    # Извлекаем названия компонентов
-    $missingComponents = foreach ($line in $errorLines) {
-        if ($line -match "'([^']+)'") {
-            $matches[1]  # Извлекаем имя компонента в кавычках
-        } elseif ($line -match "file\s+([^ ]+)") {
-            $matches[1]  # Извлекаем имя файла после "file"
-        }
-    }
+# Поиск строк, указывающих на отсутствующие пакеты
+$missingPackages = $cbsLogContent | Select-String -Pattern "MissingPackage_\d+_for_kB\d+" -AllMatches
 
-    # Убираем дубликаты и выводим результат
-    $uniqueMissing = $missingComponents | Sort-Object | Get-Unique
-
-    if ($uniqueMissing.Count -gt 0) {
-        Write-Host "Найдены отсутствующие компоненты:"
-        $uniqueMissing | ForEach-Object {
-            Write-Host $_
-        }
-        # Опционально: сохранить в файл
-        # $uniqueMissing | Out-File "missing_components.txt"
-    } else {
-        Write-Host "Отсутствующие компоненты не найдены."
+# Вывод результатов
+if ($missingPackages) {
+    Write-Host "Найдены отсутствующие пакеты:"
+    $missingPackages.Matches | ForEach-Object {
+        Write-Host $_.Value
     }
 } else {
-    Write-Host "Файл CBS.log не найден по пути: $logPath"
+    Write-Host "Отсутствующие пакеты не найдены."
+}
+
+# Поиск и вывод общего количества обнаруженных повреждений
+$corruptionSummary = $cbsLogContent | Select-String -Pattern "Total Detected Corruption:\d+"
+if ($corruptionSummary) {
+    Write-Host "`nОбщее количество обнаруженных повреждений: $($corruptionSummary.Matches[0].Value)"
+}
+
+# Поиск и вывод результата операции
+$operationResult = $cbsLogContent | Select-String -Pattern "Operation result: 0x\w+"
+if ($operationResult) {
+    Write-Host "Результат операции: $($operationResult.Matches[0].Value)"
 }
