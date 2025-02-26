@@ -47,7 +47,7 @@ function Write-Log {
     }
 }
 
-Write-Log "Начало анализа CBS.log на отсутствие компонентов..." "INFO" "Cyan"
+Write-Log "Начало анализа CBS.log на отсутствие компонентов и ошибки..." "INFO" "Cyan"
 
 # Проверка существования CBS.log
 if (-not (Test-Path $CBSLogPath)) {
@@ -66,7 +66,7 @@ switch ($Encoding.ToUpper()) {
 }
 Write-Log "Используется кодировка: $($encodingParam['Encoding'])" "INFO" "Cyan"
 
-# Фильтрация по дате в CBS.log (временно отключена для диагностики)
+# Фильтрация по дате в CBS.log
 $maxDate = (Get-Date).AddDays(-$MaxLogDays)
 function Filter-LogByDate {
     param ([string]$Line)
@@ -82,21 +82,26 @@ function Filter-LogByDate {
     return $false
 }
 
-# Паттерны для поиска всех отсутствующих компонентов (на основе примеров из ссылок)
-$componentPatterns = @(
+# Паттерны для поиска отсутствующих компонентов и ошибок (на основе форума Sysnative)
+$issuePatterns = @(
     "\(p\) CBS Catalog Missing Package.*for\s+(.+)",               # Отсутствующий пакет, например, Package_4018_for_KB4516044~...
     "CBS Manifest Corruption:\d+",                                # Коррупция манифеста, например, CBS Manifest Corruption:53
     "missing.*component\s+(.+)",                                  # Отсутствующий компонент (любой формат)
     "CBS MUM Missing.*for\s+(.+)",                                # Отсутствующий MUM-файл (любой формат)
     "CSI Payload Corrupt.*for\s+(.+)",                            # Повреждённый полезный груз (любой формат)
-    "corrupt.*file\s+(.+)"                                        # Повреждённый файл (любой формат)
+    "corrupt.*file\s+(.+)",                                       # Повреждённый файл (любой формат)
+    "CBS Watchlist Package Missing.*0x\d+\s+(.+)",                # Отсутствующий пакет в списке наблюдения, например, Package_37_for_KB2929437~...
+    "CBS Watchlist Component Missing.*0x\d+\s+(.+)",              # Отсутствующий компонент в списке наблюдения
+    "CSI C Mark Deployment Missing.*\[(.+)]",                     # Отсутствующий деплоймент компонента
+    "CSI Manifest All Zeros.*\[(.+)]",                            # Манифест с нулевыми значениями
+    "CSI F Mark Missing.*\[(.+)]"                                 # Отсутствующий F-метка компонента
 )
 
-# Анализ CBS.log на отсутствующие компоненты
+# Анализ CBS.log на отсутствующие компоненты и ошибки
 $foundIssues = @()
 $missingComponents = @()
 
-Write-Log "Начало анализа файла CBS.log на отсутствие компонентов (за последние $MaxLogDays дней)..." "INFO" "Cyan"
+Write-Log "Начало анализа файла CBS.log на отсутствие компонентов и ошибки (за последние $MaxLogDays дней)..." "INFO" "Cyan"
 try {
     $totalLines = (Get-Content $CBSLogPath @encodingParam -ReadCount 0 -ErrorAction Stop).Count
 } catch {
@@ -111,39 +116,40 @@ try {
         $progress++
         Write-Progress -Activity "Анализ CBS.log" -Status "$progress из $totalLines строк" -PercentComplete (($progress / $totalLines) * 100)
         
-        foreach ($pattern in $componentPatterns) {
+        foreach ($pattern in $issuePatterns) {
             if ($_ -match $pattern) {
-                Write-Log "Найдено совпадение (компонент): '$_'" "WARNING" "Yellow"
+                Write-Log "Найдено совпадение (компонент/ошибка): '$_'" "WARNING" "Yellow"
                 $foundIssues += $_
             }
         }
-        # Извлечение деталей всех отсутствующих компонентов
-        foreach ($pattern in $componentPatterns) {
+        # Извлечение деталей всех отсутствующих компонентов и ошибок
+        foreach ($pattern in $issuePatterns) {
             if ($_ -match $pattern) {
-                $componentName = $Matches[1]  # Извлекаем имя компонента (первая захваченная группа)
+                # Извлекаем имя компонента/ошибки из первой захваченной группы
+                $componentName = $Matches[1]
                 if ($componentName -and $componentName -ne "") {
                     # Очистка имени компонента от лишних пробелов и символов
                     $componentName = $componentName.Trim()
                     # Проверка на валидность (не пустое и содержит буквы/цифры)
                     if ($componentName -match "[A-Za-z0-9]") {
-                        Write-Log "Извлечен отсутствующий компонент: '$componentName'" "INFO" "Green"
+                        Write-Log "Извлечен отсутствующий компонент/ошибка: '$componentName'" "INFO" "Green"
                         $missingComponents += $componentName
                     } else {
-                        Write-Log "Не удалось извлечь валидное имя компонента из строки: '$_'" "WARNING" "Yellow"
+                        Write-Log "Не удалось извлечь валидное имя компонента/ошибки из строки: '$_'" "WARNING" "Yellow"
                     }
                 } else {
-                    Write-Log "Не удалось извлечь имя компонента из строки: '$_'" "WARNING" "Yellow"
+                    Write-Log "Не удалось извлечь имя компонента/ошибки из строки: '$_'" "WARNING" "Yellow"
                 }
             }
         }
         # Отладочный вывод для строк, соответствующих ключевым словам, но не обработанных
-        if ($_.Contains("(p)") -or $_.Contains("missing") -or $_.Contains("corrupt") -or $_.Contains("CBS Manifest Corruption")) {
+        if ($_.Contains("(p)") -or $_.Contains("missing") -or $_.Contains("corrupt") -or $_.Contains("CBS Manifest Corruption") -or $_.Contains("CSI") -or $_.Contains("Watchlist")) {
             $isProcessed = $false
-            foreach ($pattern in $componentPatterns) {
+            foreach ($pattern in $issuePatterns) {
                 if ($_ -match $pattern) { $isProcessed = $true; break }
             }
             if (-not $isProcessed) {
-                Write-Log "Строка с потенциальным отсутствующим компонентом, но не обработана: '$_'" "WARNING" "Yellow"
+                Write-Log "Строка с потенциальной ошибкой/отсутствующим компонентом, но не обработана: '$_'" "WARNING" "Yellow"
             }
         }
     }
@@ -159,16 +165,16 @@ $missingComponents = $missingComponents | Sort-Object -Unique | Where-Object {
 }
 
 if ($foundIssues.Count -eq 0) {
-    Write-Log "Отсутствующие компоненты не найдены." "INFO" "Green"
+    Write-Log "Отсутствующие компоненты и ошибки не найдены." "INFO" "Green"
     exit 0
 } else {
-    Write-Log "Обнаружено проблем: $($foundIssues.Count). Отсутствующих компонентов: $($missingComponents.Count)" "WARNING" "Yellow"
+    Write-Log "Обнаружено проблем: $($foundIssues.Count). Отсутствующих компонентов/ошибок: $($missingComponents.Count)" "WARNING" "Yellow"
     
     if ($missingComponents.Count -eq 0) {
-        Write-Log "Не удалось определить отсутствующие компоненты. Проверьте отладочные сообщения в логе." "ERROR" "Red"
+        Write-Log "Не удалось определить отсутствующие компоненты/ошибки. Проверьте отладочные сообщения в логе." "ERROR" "Red"
         exit 1
     }
-    Write-Log "Список отсутствующих компонентов: '$($missingComponents -join ', ')'" "INFO" "Cyan"
+    Write-Log "Список отсутствующих компонентов/ошибок: '$($missingComponents -join ', ')'" "INFO" "Cyan"
 }
 
 Write-Log "Анализ CBS.log завершён." "INFO" "Green"
