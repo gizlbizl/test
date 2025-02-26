@@ -65,8 +65,8 @@ switch ($Encoding.ToUpper()) {
 }
 Write-Log "Используется кодировка: $($encodingParam['Encoding'])" "INFO" "Cyan"
 
-# Паттерн для поиска только (p) CBS Catalog Missing пакетов
-$componentPattern = "\(p\)\s*CBS\s*Catalog\s*Missing\s+([A-Za-z0-9_]+_for_[A-Za-z0-9]+~[A-Za-z0-9]+~[A-Za-z0-9]+~~[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"
+# Паттерн для поиска только (p) CBS Catalog Missing пакетов (обновлён по примеру из форума)
+$componentPattern = "\(p\)\s*CBS\s*Catalog\s*Missing\s*\(n\)\s*([A-Za-z0-9_]+_for_[A-Za-z0-9]+~[A-Za-z0-9]+~[A-Za-z0-9]+~~[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"
 
 # Ускоренный анализ CBS.log на отсутствующие пакеты начиная с последней 'Checking System Update Readiness'
 $foundIssues = @()
@@ -86,7 +86,7 @@ try {
     $startLineNumber = $lastStartLine.LineNumber
     Write-Log "Найдена последняя строка начала анализа: '$($lastStartLine.Line)' (строка $startLineNumber)" "INFO" "Green"
 
-    # Считываем только строки после последней найденной с использованием Select-String для ключевых слов
+    # Считываем только строки после последней найденной с использованием Select-String для (p)
     $relevantLines = Select-String -Path $CBSLogPath -Pattern "\(p\)" `
         -AfterContext 0 `
         -Context ($startLineNumber, [int]::MaxValue) `
