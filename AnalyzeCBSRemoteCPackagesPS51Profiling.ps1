@@ -46,7 +46,7 @@ function Write-Log {
     }
 }
 
-Write-Log "Начало анализа CBS.log на отсутствие компонентов..." "INFO" "Cyan"
+Write-Log "Начало анализа CBS.log на отсутствие компонентов после 'Checking System Update Readiness'..." "INFO" "Cyan"
 
 # Проверка существования CBS.log
 if (-not (Test-Path $CBSLogPath)) {
@@ -65,9 +65,9 @@ switch ($Encoding.ToUpper()) {
 }
 Write-Log "Используется кодировка: $($encodingParam['Encoding'])" "INFO" "Cyan"
 
-# Паттерны для поиска всех отсутствующих компонентов (ещё более гибкие)
+# Паттерны для поиска отсутствующих компонентов (оптимизированы для скорости)
 $componentPatterns = @(
-    "\(p\)\s*CBS\s*Catalog\s*Missing\s+(.+)",                   # Отсутствующий пакет, например, Package_4086_for_KB4516044~...
+    "\(p\)\s*CBS\s*Catalog\s*Missing\s+(.+)",                   # Отсутствующий пакет, например, Package_5420_for_KB4503267~...
     "CBS\s*Manifest\s*Corruption:\d+",                          # Коррупция манифеста, например, CBS Manifest Corruption:53
     "missing.*component\s+(.+)",                                # Отсутствующий компонент (любой формат)
     "CBS\s*MUM\s*Missing.*for\s+(.+)",                          # Отсутствующий MUM-файл (любой формат)
@@ -75,41 +75,56 @@ $componentPatterns = @(
     "corrupt.*file\s+(.+)"                                      # Повреждённый файл (любой формат)
 )
 
-# Анализ CBS.log на отсутствующие компоненты
+# Анализ CBS.log на отсутствующие компоненты начиная с 'Checking System Update Readiness'
 $foundIssues = @()
 $missingComponents = @()
 
-Write-Log "Начало анализа файла CBS.log на отсутствие компонентов..." "INFO" "Cyan"
+Write-Log "Начало поиска строки 'Checking System Update Readiness'..." "INFO" "Cyan"
 try {
-    $totalLines = (Get-Content $CBSLogPath @encodingParam -ReadCount 0 -ErrorAction Stop).Count
-    Write-Log "Общее количество строк в CBS.log: $totalLines" "DEBUG" "Gray"
-} catch {
-    Write-Log "Ошибка чтения CBS.log для подсчёта строк: $($_.Exception.Message)" "ERROR" "Red"
+    $startLineFound = $false
     $totalLines = 0
-}
-$progress = 0
+    $relevantLines = @()
 
-try {
+    # Считываем файл построчно, ищем строку начала и сохраняем релевантные строки
     Get-Content $CBSLogPath @encodingParam -ReadCount 1000 -ErrorAction Stop | ForEach-Object {
+        $totalLines++
+        if ($_ -match "Checking\s*System\s*Update\s*Readiness") {
+            $startLineFound = $true
+            Write-Log "Найдена строка начала анализа: '$_' (строка $totalLines)" "INFO" "Green"
+        }
+        if ($startLineFound) {
+            $relevantLines += $_
+        }
+    }
+
+    if (-not $startLineFound) {
+        Write-Log "Строка 'Checking System Update Readiness' не найдена в CBS.log." "ERROR" "Red"
+        exit 1
+    }
+
+    Write-Log "Общее количество релевантных строк после 'Checking System Update Readiness': $($relevantLines.Count)" "INFO" "Cyan"
+    $progress = 0
+
+    # Анализируем только релевантные строки
+    foreach ($line in $relevantLines) {
         $progress++
-        Write-Progress -Activity "Анализ CBS.log" -Status "Строка $progress из $totalLines" -PercentComplete (($progress / $totalLines) * 100)
+        Write-Progress -Activity "Анализ релевантных строк" -Status "Строка $progress из $($relevantLines.Count)" -PercentComplete (($progress / $relevantLines.Count) * 100)
         
-        # Логирование всех строк для диагностики
-        Write-Log "Обработка строки: '$_'" "DEBUG" "Gray"
+        Write-Log "Обработка строки: '$line'" "DEBUG" "Gray"
         
         # Проверка всех строк на ключевые слова
         $isRelevant = $false
-        if ($_.Contains("(p)") -or $_.Contains("missing") -or $_.Contains("corrupt") -or $_.Contains("CBS Manifest Corruption")) {
+        if ($line.Contains("(p)") -or $line.Contains("missing") -or $line.Contains("corrupt") -or $line.Contains("CBS Manifest Corruption")) {
             $isRelevant = $true
-            Write-Log "Строка содержит ключевые слова: '$_'" "DEBUG" "Gray"
+            Write-Log "Строка содержит ключевые слова: '$line'" "DEBUG" "Gray"
         }
         
         foreach ($pattern in $componentPatterns) {
             Write-Log "Проверка паттерна: $pattern" "DEBUG" "Gray"
-            if ($_ -match $pattern) {
-                Write-Log "Совпадение с паттерном '$pattern': '$_'" "DEBUG" "Gray"
-                Write-Log "Найдено совпадение (компонент): '$_'" "WARNING" "Yellow"
-                $foundIssues += $_
+            if ($line -match $pattern) {
+                Write-Log "Совпадение с паттерном '$pattern': '$line'" "DEBUG" "Gray"
+                Write-Log "Найдено совпадение (компонент): '$line'" "WARNING" "Yellow"
+                $foundIssues += $line
                 
                 # Извлечение компонента
                 $componentName = $Matches[1]
@@ -119,26 +134,26 @@ try {
                         Write-Log "Извлечён компонент: '$componentName' (паттерн: $pattern)" "INFO" "Green"
                         $missingComponents += $componentName
                     } else {
-                        Write-Log "Не удалось извлечь валидное имя компонента из строки: '$_' (паттерн: $pattern)" "WARNING" "Yellow"
+                        Write-Log "Не удалось извлечь валидное имя компонента из строки: '$line' (паттерн: $pattern)" "WARNING" "Yellow"
                     }
                 } else {
-                    Write-Log "Не удалось извлечь имя компонента из строки: '$_' (паттерн: $pattern)" "WARNING" "Yellow"
+                    Write-Log "Не удалось извлечь имя компонента из строки: '$line' (паттерн: $pattern)" "WARNING" "Yellow"
                 }
             } else {
-                Write-Log "Паттерн '$pattern' не совпал с: '$_'" "DEBUG" "Gray"
+                Write-Log "Паттерн '$pattern' не совпал с: '$line'" "DEBUG" "Gray"
             }
         }
         
         # Отладочный вывод для нераспознанных строк с ключевыми словами
         if ($isRelevant -and $foundIssues.Count -eq 0) {
-            Write-Log "Строка с потенциальным отсутствующим компонентом, но не обработана: '$_'" "WARNING" "Yellow"
+            Write-Log "Строка с потенциальным отсутствующим компонентом, но не обработана: '$line'" "WARNING" "Yellow"
         }
     }
 } catch {
     Write-Log "Ошибка анализа CBS.log: $($_.Exception.Message)" "ERROR" "Red"
     exit 1
 }
-Write-Progress -Activity "Анализ CBS.log" -Completed
+Write-Progress -Activity "Анализ релевантных строк" -Completed
 
 # Удаление дубликатов компонентов и фильтрация пустых или невалидных значений
 $missingComponents = $missingComponents | Sort-Object -Unique | Where-Object { 
@@ -146,7 +161,7 @@ $missingComponents = $missingComponents | Sort-Object -Unique | Where-Object {
 }
 
 if ($foundIssues.Count -eq 0) {
-    Write-Log "Отсутствующие компоненты не найдены." "INFO" "Green"
+    Write-Log "Отсутствующие компоненты не найдены после 'Checking System Update Readiness'." "INFO" "Green"
     exit 0
 } else {
     Write-Log "Обнаружено проблем: $($foundIssues.Count). Отсутствующих компонентов: $($missingComponents.Count)" "WARNING" "Yellow"
@@ -158,4 +173,4 @@ if ($foundIssues.Count -eq 0) {
     Write-Log "Список отсутствующих компонентов: '$($missingComponents -join ', ')'" "INFO" "Cyan"
 }
 
-Write-Log "Анализ CBS.log завершён. Обработано строк: $progress" "INFO" "Green"
+Write-Log "Анализ CBS.log завершён. Обработано релевантных строк: $progress" "INFO" "Green"
