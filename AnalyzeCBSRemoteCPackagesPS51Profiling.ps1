@@ -46,9 +46,9 @@ function Write-Log {
     )
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "$timestamp [$Level] - $Message"
-    if (-not $script:Quiet) { Write-Host $logEntry -ForegroundColor $Color }
+    if (-not $Quiet) { Write-Host $logEntry -ForegroundColor $Color }
     try {
-        $logEntry | Out-File -FilePath $script:logFile -Append -Encoding UTF8 -ErrorAction Stop
+        $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8 -ErrorAction Stop
     } catch {
         Write-Error "Ошибка записи в лог: $($_.Exception.Message)"
     }
@@ -150,35 +150,19 @@ if ($foundIssues.Count -eq 0) {
     Write-Log "Список сохранён в: $csvPath" "INFO" "Green"
 }
 
-# Ускоренный поиск компонентов на удалённых серверах и восстановление
+# Ускоренный поиск компонентов на удалённых серверах и восстановление (последовательно для PowerShell 5)
 if ($RemoteComponentSearch) {
     Write-Log "RemoteComponentSearch активирован. Компонентов для поиска: $($missingComponents.Count)" "INFO" "Cyan"
     if ($missingComponents.Count -eq 0) {
         Write-Log "Нет компонентов для поиска на удалённых серверах." "WARNING" "Yellow"
     } else {
-        Write-Log "Параллельный поиск компонентов на серверах по маске '$ServerMask' ($ServerRangeStart-$ServerRangeEnd)..." "INFO" "Cyan"
-        $serverList = $ServerRangeStart..$ServerRangeEnd | ForEach-Object { 
-            $serverNum = "{0:D2}" -f $_
-            $ServerMask -replace "##", $serverNum
-        }
-
-        $results = $serverList | ForEach-Object -ThrottleLimit 4 -Parallel {
-            $serverName = $_
-            $logBaseDir = $using:logBaseDir
-            $missingComponents = $using:missingComponents
-            $Quiet = $using:Quiet
-            $logFile = $using:logFile
-
-            function Write-LogLocal {
-                param ([string]$Message, [string]$Level = "INFO", [string]$Color = "White")
-                $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                $logEntry = "$timestamp [$Level] - $Message"
-                if (-not $Quiet) { Write-Host $logEntry -ForegroundColor $Color }
-                $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
-            }
+        Write-Log "Последовательный поиск компонентов на серверах по маске '$ServerMask' ($ServerRangeStart-$ServerRangeEnd)..." "INFO" "Cyan"
+        for ($i = $ServerRangeStart; $i -le $ServerRangeEnd; $i++) {
+            $serverNum = "{0:D2}" -f $i
+            $serverName = $ServerMask -replace "##", $serverNum
 
             if (Test-Connection -ComputerName $serverName -Count 1 -Quiet -ErrorAction SilentlyContinue) {
-                Write-LogLocal "Сервер $serverName доступен. Поиск компонентов..." "INFO" "Green"
+                Write-Log "Сервер $serverName доступен. Поиск компонентов..." "INFO" "Green"
                 $searchPaths = @(
                     "\\$serverName\c$\Windows\winsxs\Manifests",
                     "\\$serverName\c$\Windows\Servicing\Packages"
@@ -198,16 +182,16 @@ if ($RemoteComponentSearch) {
                             if (Wait-Job $job -Timeout $timeout) {
                                 $foundFiles = Receive-Job $job -ErrorAction SilentlyContinue
                                 if ($foundFiles) {
-                                    Write-LogLocal "[$serverName] Найден компонент '$component' в:" "INFO" "Green"
+                                    Write-Log "[$serverName] Найден компонент '$component' в:" "INFO" "Green"
                                     $foundFiles | ForEach-Object { 
-                                        Write-LogLocal "[$serverName]   - $($_.FullName)" "INFO" "Green" 
+                                        Write-Log "[$serverName]   - $($_.FullName)" "INFO" "Green" 
                                         $foundPaths[$component] = $_.DirectoryName
                                     }
                                     $foundComponents += $component
                                     break
                                 }
                             } else {
-                                Write-LogLocal "[$serverName] Тайм-аут поиска для '$component' в $path." "WARNING" "Yellow"
+                                Write-Log "[$serverName] Тайм-аут поиска для '$component' в $path." "WARNING" "Yellow"
                             }
                             Remove-Job $job -Force -ErrorAction SilentlyContinue
                         }
@@ -217,55 +201,47 @@ if ($RemoteComponentSearch) {
                 if ($foundComponents.Count -gt 0) {
                     $csvPath = Join-Path $logBaseDir "FoundComponents_${serverName}_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
                     $foundComponents | Select-Object @{Name="Component";Expression={$_}} | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -ErrorAction SilentlyContinue
-                    Write-LogLocal "[$serverName] Найденные компоненты сохранены в: $csvPath" "INFO" "Green"
-                    return @{ Server = $serverName; Components = $foundComponents; Paths = $foundPaths }
-                } else {
-                    Write-LogLocal "[$serverName] Компоненты не найдены." "WARNING" "Yellow"
-                }
-            } else {
-                Write-LogLocal "Сервер $serverName недоступен." "WARNING" "Yellow"
-            }
-            return $null
-        }
+                    Write-Log "[$serverName] Найденные компоненты сохранены в: $csvPath" "INFO" "Green"
 
-        # Обработка результатов и восстановление
-        foreach ($result in $results | Where-Object { $_ }) {
-            $serverName = $result.Server
-            $foundComponents = $result.Components
-            $foundPaths = $result.Paths
+                    # Запрос подтверждения для DISM /Cleanup-Image /RestoreHealth
+                    Write-Log "[$serverName] Обнаружены компоненты. Запустить DISM /Online /Cleanup-Image /RestoreHealth с источником $serverName? (Y/N)" "INFO" "Cyan"
+                    $response = Read-Host "Введите Y для продолжения"
+                    if ($response -eq "Y" -or $response -eq "y") {
+                        Write-Log "[$serverName] Запуск DISM /Online /Cleanup-Image /RestoreHealth..." "INFO" "Cyan"
+                        $sourcePath = ($foundPaths.Values | Select-Object -First 1) -replace "\\\\$serverName\\c\$", ""
+                        $dismCommand = "DISM /Online /Cleanup-Image /RestoreHealth /Source:\\$serverName\c$\$sourcePath /LimitAccess"
+                        Write-Log "[$serverName] Выполняется: $dismCommand" "INFO" "Cyan"
+                        $dismResult = Invoke-Expression $dismCommand 2>&1
+                        $dismResult | ForEach-Object { Write-Log "[$serverName] DISM: $_" "INFO" "Green" }
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Log "[$serverName] DISM успешно завершён." "INFO" "Green"
+                        } else {
+                            Write-Log "[$serverName] Ошибка DISM. Код: $LASTEXITCODE" "ERROR" "Red"
+                        }
 
-            Write-Log "[$serverName] Обнаружены компоненты: $($foundComponents.Count)" "INFO" "Cyan"
-            Write-Log "[$serverName] Запустить DISM /RestoreHealth с источником $serverName? (Y/N)" "INFO" "Cyan"
-            $response = Read-Host "Введите Y для продолжения"
-            if ($response -eq "Y" -or $response -eq "y") {
-                Write-Log "[$serverName] Запуск DISM /Online /RestoreHealth..." "INFO" "Cyan"
-                $sourcePath = ($foundPaths.Values | Select-Object -First 1) -replace "\\\\$serverName\\c\$", ""
-                $dismCommand = "DISM /Online /RestoreHealth /Source:\\$serverName\c$\$sourcePath /LimitAccess"
-                Write-Log "[$serverName] Выполняется: $dismCommand" "INFO" "Cyan"
-                $dismResult = Invoke-Expression $dismCommand 2>&1
-                $dismResult | ForEach-Object { Write-Log "[$serverName] DISM: $_" "INFO" "Green" }
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Log "[$serverName] DISM успешно завершён." "INFO" "Green"
-                } else {
-                    Write-Log "[$serverName] Ошибка DISM. Код: $LASTEXITCODE" "ERROR" "Red"
-                }
-
-                Write-Log "[$serverName] Запустить SFC /ScanNow? (Y/N)" "INFO" "Cyan"
-                $sfcResponse = Read-Host "Введите Y для продолжения"
-                if ($sfcResponse -eq "Y" -or $sfcResponse -eq "y") {
-                    Write-Log "[$serverName] Запуск SFC /ScanNow..." "INFO" "Cyan"
-                    $sfcResult = Invoke-Expression "SFC /ScanNow" 2>&1
-                    $sfcResult | ForEach-Object { Write-Log "[$serverName] SFC: $_" "INFO" "Green" }
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Log "[$serverName] SFC успешно завершён." "INFO" "Green"
+                        # Запрос подтверждения для SFC
+                        Write-Log "[$serverName] Запустить SFC /ScanNow? (Y/N)" "INFO" "Cyan"
+                        $sfcResponse = Read-Host "Введите Y для продолжения"
+                        if ($sfcResponse -eq "Y" -or $sfcResponse -eq "y") {
+                            Write-Log "[$serverName] Запуск SFC /ScanNow..." "INFO" "Cyan"
+                            $sfcResult = Invoke-Expression "SFC /ScanNow" 2>&1
+                            $sfcResult | ForEach-Object { Write-Log "[$serverName] SFC: $_" "INFO" "Green" }
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Log "[$serverName] SFC успешно завершён." "INFO" "Green"
+                            } else {
+                                Write-Log "[$serverName] Ошибка SFC. Код: $LASTEXITCODE" "ERROR" "Red"
+                            }
+                        } else {
+                            Write-Log "[$serverName] SFC пропущен." "INFO" "Yellow"
+                        }
                     } else {
-                        Write-Log "[$serverName] Ошибка SFC. Код: $LASTEXITCODE" "ERROR" "Red"
+                        Write-Log "[$serverName] DISM пропущен." "INFO" "Yellow"
                     }
                 } else {
-                    Write-Log "[$serverName] SFC пропущен." "INFO" "Yellow"
+                    Write-Log "[$serverName] Компоненты не найдены." "WARNING" "Yellow"
                 }
             } else {
-                Write-Log "[$serverName] DISM пропущен." "INFO" "Yellow"
+                Write-Log "Сервер $serverName недоступен." "WARNING" "Yellow"
             }
         }
     }
