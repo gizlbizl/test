@@ -166,12 +166,15 @@ if ($RemoteComponentSearch) {
             $serverName = $_
             $logBaseDir = $using:logBaseDir
             $missingComponents = $using:missingComponents
+            $Quiet = $using:Quiet
+            $logFile = $using:logFile
+
             function Write-LogLocal {
                 param ([string]$Message, [string]$Level = "INFO", [string]$Color = "White")
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 $logEntry = "$timestamp [$Level] - $Message"
-                if (-not $using:Quiet) { Write-Host $logEntry -ForegroundColor $Color }
-                $logEntry | Out-File -FilePath $using:logFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+                if (-not $Quiet) { Write-Host $logEntry -ForegroundColor $Color }
+                $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
             }
 
             if (Test-Connection -ComputerName $serverName -Count 1 -Quiet -ErrorAction SilentlyContinue) {
@@ -184,19 +187,29 @@ if ($RemoteComponentSearch) {
                 $foundPaths = @{}
 
                 foreach ($component in $missingComponents) {
-                    $searchPattern = "*$component*.cab"  # Ограничиваем поиск .cab файлами
+                    $searchPattern = "*$component*.cab"  # Ограничение поиска .cab файлами
                     foreach ($path in $searchPaths) {
                         if (Test-Path $path -ErrorAction SilentlyContinue) {
-                            $foundFiles = Get-ChildItem -Path $path -Filter $searchPattern -File -ErrorAction SilentlyContinue
-                            if ($foundFiles) {
-                                Write-LogLocal "[$serverName] Найден компонент '$component' в:" "INFO" "Green"
-                                $foundFiles | ForEach-Object { 
-                                    Write-LogLocal "[$serverName]   - $($_.FullName)" "INFO" "Green" 
-                                    $foundPaths[$component] = $_.DirectoryName
+                            $timeout = 30  # Ограничение времени на поиск в секундах
+                            $job = Start-Job -ScriptBlock {
+                                param($path, $pattern)
+                                Get-ChildItem -Path $path -Filter $pattern -File -ErrorAction SilentlyContinue
+                            } -ArgumentList $path, $searchPattern
+                            if (Wait-Job $job -Timeout $timeout) {
+                                $foundFiles = Receive-Job $job -ErrorAction SilentlyContinue
+                                if ($foundFiles) {
+                                    Write-LogLocal "[$serverName] Найден компонент '$component' в:" "INFO" "Green"
+                                    $foundFiles | ForEach-Object { 
+                                        Write-LogLocal "[$serverName]   - $($_.FullName)" "INFO" "Green" 
+                                        $foundPaths[$component] = $_.DirectoryName
+                                    }
+                                    $foundComponents += $component
+                                    break
                                 }
-                                $foundComponents += $component
-                                break
+                            } else {
+                                Write-LogLocal "[$serverName] Тайм-аут поиска для '$component' в $path." "WARNING" "Yellow"
                             }
+                            Remove-Job $job -Force -ErrorAction SilentlyContinue
                         }
                     }
                 }
